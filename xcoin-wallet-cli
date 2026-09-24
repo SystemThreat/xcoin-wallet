@@ -1,0 +1,10 @@
+#!/bin/sh
+# Resolve symlinks so an installed ~/.local/bin/xcoin-wallet still finds
+# wallet_cli.py beside the REAL script, not beside the symlink.
+SELF="$0"
+while [ -h "$SELF" ]; do
+  D="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$D/$SELF";; esac
+done
+exec python3 "$(cd "$(dirname "$SELF")" && pwd)/wallet_cli.py" "$@"
