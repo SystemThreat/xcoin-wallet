@@ -7,4 +7,4 @@ while [ -h "$SELF" ]; do
   SELF="$(readlink "$SELF")"
   case "$SELF" in /*) ;; *) SELF="$D/$SELF";; esac
 done
-exec python3 "$(cd "$(dirname "$SELF")" && pwd)/wallet_cli.py" "$@"
+exec python3 -B "$(cd "$(dirname "$SELF")" && pwd)/wallet_cli.py" "$@"

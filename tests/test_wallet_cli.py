@@ -723,3 +723,17 @@ class TestIdentity(unittest.TestCase):
         self.addCleanup(setattr, subprocess, "run", real)
         with self.assertRaises(w.WalletError) as cm: w.derive_offline(SEED, 101)
         self.assertIn("rebuild", str(cm.exception))
+
+
+class TestV3Vectors(unittest.TestCase):
+    """The native keytool must replay the node's golden vectors (leaf/branch/
+    control/tag) and the sighash regression lock validated by the mined spends
+    of 2026-09-24. Runs only when the keytool is built."""
+    def test_vectors_replay(self):
+        tool = w.keytool_path()
+        if not tool: self.skipTest("native keytool not built")
+        import subprocess
+        r = subprocess.run([str(tool), "_v3vectors"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("FAIL", r.stdout)
+        self.assertIn("sighash-in1", r.stdout)

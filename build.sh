@@ -23,3 +23,7 @@ clang++ -O2 -arch arm64 -std=c++17 -I"$PQ/common" -I"$PQ/ml-dsa-65" \
 codesign -s - -f xcoin-wallet 2>/dev/null || true
 rm -f *.o
 echo "✅ built ./xcoin-wallet"
+
+# The build is only good if it still speaks the chain's v3 byte language.
+./xcoin-wallet _v3vectors >/dev/null || { echo "❌ v3 golden vectors FAILED — do not use this build"; exit 1; }
+echo "✅ v3 golden vectors verified"

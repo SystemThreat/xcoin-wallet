@@ -380,7 +380,7 @@ class ExplorerRPC:
         except urllib.error.HTTPError as e:
             try: out = json.loads(e.read().decode(), parse_float=Decimal)
             except Exception: raise WalletError(f"explorer {path}: HTTP {e.code}")
-            raise WalletError(f"explorer {path}: {out.get('error', 'failed')}")
+            raise WalletError(f"explorer {path}: {out.get('error', 'failed') if isinstance(out, dict) else out}")
         except Exception as e:
             raise WalletError(f"cannot reach the explorer at {self.base}: {e}")
     def call(self, method, params=None, timeout=60):
@@ -404,12 +404,15 @@ class ExplorerRPC:
             out = self._get(f"/api/utxos/{addr}", timeout=timeout)
             return {"success": True, "height": out.get("height"),
                     "total_amount": out.get("total_amount"),
-                    "unspents": [{"txid": u["txid"], "vout": u["vout"],
+                    "unspents": [{k: v for k, v in {
+                                  "txid": u["txid"], "vout": u["vout"],
                                   "scriptPubKey": u["scriptPubKey"], "amount": u["amount"],
                                   "coinbase": u.get("coinbase", False), "height": u.get("height"),
-                                  "confirmations": u.get("confirmations")} for u in out.get("utxos", [])]}
+                                  "confirmations": u.get("confirmations")}.items() if v is not None}
+                                 for u in out.get("utxos", [])]}
         if method == "getmempoolinfo":
-            return {"minrelaytxfee": Decimal("0.00000100")}
+            # the chain's relay floor: DEFAULT_MIN_RELAY_TX_FEE = 1,000 sat/kvB = 1 sat/vB
+            return {"minrelaytxfee": Decimal("0.00001000")}
         if method == "estimatesmartfee":
             out = self._get("/api/feerate")
             satvb = Decimal(str(out.get("feerate_sat_vb", 1)))
@@ -432,7 +435,7 @@ class ExplorerRPC:
             except urllib.error.HTTPError as e:
                 try: out = json.loads(e.read().decode())
                 except Exception: raise WalletError(f"broadcast failed: HTTP {e.code}")
-                raise WalletError(f"broadcast rejected: {out.get('reason', out.get('error', 'unknown'))}")
+                raise WalletError(f"broadcast rejected: {out.get('reason', out.get('error', 'unknown')) if isinstance(out, dict) else out}")
             except WalletError: raise
             except Exception as e:
                 raise WalletError(f"cannot reach the explorer at {self.base}: {e}")
@@ -504,6 +507,15 @@ def sign_offline(seed, raw, prev):
         raise WalletError("offline signer returned no valid transaction")
     return out
 
+
+def resolve_hrp(args):
+    """HRP for offline-capable commands: --hrp wins; a configured explorer is
+    asked; a fully offline run defaults to mainnet's xpa."""
+    if getattr(args, "hrp", None): return args.hrp
+    if getattr(args, "explorer", None) or os.getenv("XCOIN_EXPLORER"):
+        try: return backend_hrp(make_backend(args))
+        except WalletError: pass
+    return "xpa"
 
 def backend_hrp(rpc, args=None):
     """The chain's address HRP: --hrp wins, else the backend's chain answers
@@ -587,7 +599,7 @@ def fee_for(n_in, n_out, feerate):
 
 def resolve_feerate(rpc, args):
     """Return (feerate XCF/kvB, source). Never below the node's relay floor."""
-    floor = Decimal("0.00000100")
+    floor = Decimal("0.00001000")   # 1 sat/vB: the chain's DEFAULT_MIN_RELAY_TX_FEE
     try:
         mi = rpc.call("getmempoolinfo")
         floor = max(money(mi.get("minrelaytxfee", floor)), money(mi.get("mempoolminfee", 0)))
@@ -849,7 +861,7 @@ def cmd_receive(args):
     # Address derivation is offline: no node, no RPC credentials needed.
     # `address`/`receive` print the address; `--identity` (or the `identity`
     # subcommand) prints the same key's forum handle xid1… instead.
-    info = derive_offline(require_seed(args), args.index, getattr(args, "hrp", None) or "xpa")
+    info = derive_offline(require_seed(args), args.index, resolve_hrp(args))
     if args.json:
         emit_json({"address": info["address"], "identity": info["identity"], "index": args.index, "scriptPubKey": info["scriptPubKey"]}); return
     print(info["identity"] if args.identity else info["address"])
@@ -875,7 +887,7 @@ def cmd_signmessage(args):
     template = args.template if args.template is not None else args.message
     if template is None or template == "":
         raise WalletError("signmessage needs --template TEXT (with {address}) or --message TEXT")
-    hrp = getattr(args, "hrp", None) or "xpa"
+    hrp = resolve_hrp(args)
     info = derive_offline(seed, index, hrp)
     signer = info["address"] if args.sign_as == "address" else info["identity"]
     message = template.replace("{address}", signer)
@@ -905,7 +917,7 @@ def cmd_addresses(args):
     seed = require_seed(args)                  # offline derivation: no RPC needed
     rows = []
     for i in range(args.start, args.start + args.count):
-        info = derive(None, seed, i)
+        info = derive_offline(seed, i, resolve_hrp(args))
         row = {"index": i, "address": info["address"]}
         if args.identity: row["identity"] = info["identity"]
         rows.append(row)
@@ -951,6 +963,8 @@ def cmd_send(args):
     if not valid or not valid.get("isvalid"): raise WalletError("destination is not a valid address for this node")
     amount = money(args.amount)
     if amount <= 0: raise WalletError("amount must be positive")
+    if amount < DUST_CHANGE:
+        raise WalletError(f"amount {fmt(amount)} is below the consensus output floor {fmt(DUST_CHANGE)} (10,000 sat); the network rejects such outputs")
     max_fee = money(args.max_fee, "max-fee")
     mature, immature = classify_utxos(result)
 

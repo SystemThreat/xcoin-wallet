@@ -511,7 +511,7 @@ static int cmd_sign() {
     for (size_t i=0;i<tx.vin.size();i++) {
         const PrevOut* pv=byin[i];
         std::vector<uint8_t> pk, sk;
-        if (!derive_keypair(seed, pv->keyindex, pk, sk)) { fprintf(stderr,"sign: key derivation failed\n"); return 1; }
+        if (!derive_keypair(seed, pv->keyindex, pk, sk)) { memset(sk.data(),0,sk.size()); fprintf(stderr,"sign: key derivation failed\n"); return 1; }
 
         if (pv->spk.size()==34 && pv->spk[0]==0x53 && pv->spk[1]==0x20) {
             // witness v3 (OP_3 PUSH32): single ML-DSA leaf spend.
@@ -547,6 +547,8 @@ static int cmd_sign() {
             fprintf(stderr,"sign: input %zu is neither witness-v3 nor witness-v2 PQ\n", i); return 1;
         }
     }
+
+    memset(seed.data(), 0, seed.size());   // seed no longer needed once every input is signed
 
     // serialize signed tx (segwit format)
     std::vector<uint8_t> out;
@@ -688,14 +690,51 @@ static int cmd_v3vectors() {
     std::vector<uint8_t> ctrl = v3_control_block();
     if (ctrl.size() == 33 && ctrl[0] == 0xc0 && memcmp(ctrl.data() + 1, nk, 32) == 0) printf("ok   control-block\n");
     else { printf("FAIL control-block\n"); fails++; }
+
+    // Sighash regression lock: a fixed 2-in/2-out transaction, message bytes
+    // per input. The construction these constants pin produced the spends the
+    // chain accepted and mined on 2026-09-24 (88665c29…, f035c14d…, cd5b6f71…);
+    // any drift in field order, hashing or endianness fails here first.
+    {
+        Tx tx; tx.version = 2; tx.locktime = 700;
+        TxIn i0{}; memset(i0.hash, 0x11, 32); i0.vout = 0; i0.sequence = 0xfffffffd;
+        TxIn i1{}; memset(i1.hash, 0x22, 32); i1.vout = 1; i1.sequence = 0xfffffffd;
+        tx.vin = {i0, i1};
+        TxOut o0; o0.value = 100000; o0.spk = {0x53, 0x20}; o0.spk.insert(o0.spk.end(), 32, 0xaa);
+        TxOut o1; o1.value = 250000; o1.spk = {0x53, 0x20}; o1.spk.insert(o1.spk.end(), 32, 0xbb);
+        tx.vout = {o0, o1};
+        PrevOut p0{}; memcpy(p0.hash, i0.hash, 32); p0.vout = 0; p0.amount = 300000;
+        p0.spk = {0x53, 0x20}; p0.spk.insert(p0.spk.end(), 32, 0xcc);
+        PrevOut p1{}; memcpy(p1.hash, i1.hash, 32); p1.vout = 1; p1.amount = 60000;
+        p1.spk = {0x53, 0x20}; p1.spk.insert(p1.spk.end(), 32, 0xdd);
+        std::vector<const PrevOut*> byin{&p0, &p1};
+        V3TxHashes h; v3_precompute(tx, byin, h);
+        uint8_t lh0[32]; memset(lh0, 0xee, 32);
+        uint8_t lh1[32]; memset(lh1, 0xff, 32);
+        uint8_t sh0[32], sh1[32];
+        v3_sighash(tx, 0, h, lh0, sh0);
+        v3_sighash(tx, 1, h, lh1, sh1);
+        if (getenv("V3VECTORS_GEN")) { printf("gen  sighash-in0 %s\n", to_hex(sh0, 32).c_str()); printf("gen  sighash-in1 %s\n", to_hex(sh1, 32).c_str()); }
+        else {
+            check("sighash-in0", sh0, "c12202292bdb20c61dc34f13381c1d589854ab0436ac34fb69ea1162d30fa187");
+            check("sighash-in1", sh1, "966b91132bec61fe663d0636ce13b4cc56742c34e9c18e7ebfe0df5e034622dd");
+        }
+    }
     return fails == 0 ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
-    for (int i = 2; i + 1 < argc; i++)
-        if (std::string(argv[i]) == "--hrp") g_hrp = argv[i + 1];
-    if (const char* e = getenv("XCOIN_HRP")) if (*e) g_hrp = e;
+    bool hrp_flag = false;
+    for (int i = 2; i < argc; i++)
+        if (std::string(argv[i]) == "--hrp") {
+            if (i + 1 >= argc) { fprintf(stderr, "error: --hrp requires a value (xpa or txa)\n"); return 1; }
+            g_hrp = argv[++i]; hrp_flag = true;
+        }
+    // The env var is a fallback for flagless callers, never an override: an
+    // explicit --hrp always wins (a stale export must not flip address forms).
+    if (!hrp_flag)
+        if (const char* e = getenv("XCOIN_HRP")) if (*e) g_hrp = e;
     if (g_hrp != "xpa" && g_hrp != "txa") { fprintf(stderr, "error: --hrp must be xpa (mainnet) or txa (testnet A)\n"); return 1; }
     if (std::string(argv[1]) == "sign") return cmd_sign();
     if (std::string(argv[1]) == "_v3vectors") return cmd_v3vectors();
