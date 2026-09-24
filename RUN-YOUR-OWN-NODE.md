@@ -49,9 +49,8 @@ on your side**. You only need a node when you want to *see* or *spend* those coi
 
 ## 4. Run your own node
 
-> The node's source repository is not yet public (it is on the mainnet-readiness
-> checklist ahead of the September 30, 2026 genesis). Until it opens, this section
-> is for operators who already have a build; everything in sections 1–3 — keys,
+> The full node is public: [github.com/SystemThreat/xCoin](https://github.com/SystemThreat/xCoin)
+> — build `nexd` from it (see its INSTALL.md). Everything in sections 1–3 — keys,
 > identity, forum sign-in — works with no node at all.
 
 The wallet is a full-node client (like `bitcoin-cli` needs `bitcoind`). Point your
