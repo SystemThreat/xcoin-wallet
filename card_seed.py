@@ -494,12 +494,15 @@ def make_permanent(uid_hex):
     os.replace(tmp, p)
     return p
 
-def read_factor(transport):
+def read_factor(transport, store=None):
     """Tap a provisioned card, return (SecureBuffer factor, auth record).
-    Reads via the stored read key (file 0x03 Read access = key 3)."""
+    Reads via the stored read key (file 0x03 Read access = key 3).
+    `store` (ported from dex-wallet-cli's read_factor, unlock scope only): an
+    object with .load(uid_hex) -> key record — the dex-era v5 one-file wallet
+    keeps its records INSIDE the .mmm file; None keeps the card-<uid>.auth files."""
     transport.wait_for_card()
     card = _connect(transport)
-    auth = load_auth(card.uid().hex())
+    auth = store.load(card.uid().hex()) if store is not None else load_auth(card.uid().hex())
     read_no = auth.get("read_key_no", KEY_READ)
     card.auth_ev2(read_no, bytes.fromhex(auth["read_key"]))
     factor = SecureBuffer(card.read_full(CARD_FILE, FACTOR_OFFSET, FACTOR_LEN))

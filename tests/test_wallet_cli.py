@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for wallet_cli.py — all offline, RPC is faked, nothing is broadcast."""
 
-import io, json, os, sys, tempfile, unittest
+import hashlib, hmac, io, json, os, sys, tempfile, types, unittest
 from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
@@ -737,3 +737,213 @@ class TestV3Vectors(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("FAIL", r.stdout)
         self.assertIn("sighash-in1", r.stdout)
+
+
+# --- dex-wallet-era ENCODERS, test-local (ported from dex-wallet-cli/wallet_cli.py's
+# _seal/wallet_payload/mmm4_encode/mmm5_encode) so v4/v5 fixtures need no dex checkout
+# and no hardware. The SLH derivation is copied too, locking the constants independently
+# of wallet_cli's own slh_seed().
+def _dex_scrypt(secret, salt):
+    dk = hashlib.scrypt(secret, salt=salt, n=1 << 15, r=8, p=1, maxmem=128 * 1024 * 1024, dklen=64)
+    return dk[:32], dk[32:]
+
+def _seal(secret, prefix, payload):
+    salt, nonce = os.urandom(16), os.urandom(16)
+    enc_key, mac_key = _dex_scrypt(secret, salt)
+    stream = hashlib.shake_256(enc_key + nonce).digest(len(payload))
+    body = prefix + salt + nonce + bytes(a ^ b for a, b in zip(payload, stream))
+    return body + hmac.new(mac_key, body, hashlib.sha256).digest()
+
+def _slh_seed(seed_hex, index):
+    master = hashlib.shake_256(bytes.fromhex(seed_hex) + b"NEX-PQ-MASTER").digest(32)
+    child = hashlib.shake_256(master + index.to_bytes(4, "little") + b"NEX-PQ-CHILD").digest(32)
+    return hashlib.shake_256(child + b"xcoin/hd/slh-dsa-sha2-128s/seed").digest(48)
+
+def wallet_payload(seed_hex, slh=None):
+    seed = bytes.fromhex(seed_hex)
+    return bytes([4, len(seed)]) + seed + (_slh_seed(seed_hex, 0) if slh is None else slh)
+
+def mmm4_encode(seed_hex, secret_bytes, kind, family_hex=None, slh=None):
+    prefix = b"XCOINMMM4\n" + bytes([kind]) + (bytes.fromhex(family_hex) if family_hex else b"")
+    return _seal(secret_bytes, prefix, wallet_payload(seed_hex, slh))
+
+def mmm5_encode(family_hex, cards, passphrase, seed_hex, factor_bytes):
+    a = _seal(passphrase.encode(), b"XCOINMMM5A", json.dumps(cards, separators=(",", ":")).encode())
+    b = _seal(factor_bytes + passphrase.encode(), b"XCOINMMM5B", wallet_payload(seed_hex))
+    return b"XCOINMMM5\n" + bytes([2]) + bytes.fromhex(family_hex) + len(a).to_bytes(2, "big") + a + b
+
+
+class DexFormatBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, w, "PASSPHRASE_FROM_FD", None)
+    def use_passphrase(self, pw):
+        w.PASSPHRASE_FROM_FD = pw
+    def no_prompt(self):
+        real = w.can_prompt; w.can_prompt = lambda: False
+        self.addCleanup(setattr, w, "can_prompt", real)
+    def write(self, name, blob):
+        p = Path(self.tmp.name) / name; p.write_bytes(blob); os.chmod(p, 0o600); return p
+
+
+class TestMmm4Format(DexFormatBase):
+    """XCOINMMM4 (dex-wallet-era) opens read-only: passphrase kind unlocks through
+    read_seed; the stored SLH seed is integrity-checked; card kinds are refused
+    honestly (dex's `new` only ever wrote passphrase-kind v4 — cards went to v5)."""
+    def test_roundtrip_with_passphrase(self):
+        blob = mmm4_encode(SEED, b"pw123", 1)
+        self.assertNotIn(bytes.fromhex(SEED), blob)          # seed bytes never stored raw
+        self.assertEqual(w.mmm4_decode(blob, b"pw123"), SEED)
+        p = self.write("v4.mmm", blob)
+        self.use_passphrase("pw123"); self.no_prompt()
+        self.assertEqual(w.read_seed(p), SEED)
+    def test_empty_passphrase_unlocks_without_prompting(self):
+        p = self.write("v4open.mmm", mmm4_encode(SEED, b"", 1))
+        self.no_prompt()
+        self.assertEqual(w.read_seed(p), SEED)
+    def test_wrong_passphrase_is_honest(self):
+        blob = mmm4_encode(SEED, b"pw123", 1)
+        with self.assertRaisesRegex(w.WalletError, "wrong passphrase"):
+            w.mmm4_decode(blob, b"nope")
+        p = self.write("v4.mmm", blob)
+        self.use_passphrase("nope"); self.no_prompt()
+        with self.assertRaisesRegex(w.WalletError, "passphrase"):
+            w.read_seed(p)
+    def test_tamper_detected(self):
+        blob = bytearray(mmm4_encode(SEED, b"pw123", 1))
+        blob[50] ^= 0x01                                      # flip a ciphertext bit
+        with self.assertRaises(w.WalletError):
+            w.mmm4_decode(bytes(blob), b"pw123")
+    def test_slh_integrity_check(self):
+        # A properly sealed payload whose STORED slh_seed is corrupt must be refused
+        # as derivation drift — and read_seed must surface it, not eat it as one more
+        # wrong passphrase.
+        bad_slh = bytearray(_slh_seed(SEED, 0)); bad_slh[0] ^= 0x01
+        blob = mmm4_encode(SEED, b"pw123", 1, slh=bytes(bad_slh))
+        with self.assertRaisesRegex(w.WalletError, "drift"):
+            w.mmm4_decode(blob, b"pw123")
+        p = self.write("v4drift.mmm", blob)
+        self.use_passphrase("pw123"); self.no_prompt()
+        with self.assertRaisesRegex(w.WalletError, "drift"):
+            w.read_seed(p)
+    def test_card_kinds_refused_honestly(self):
+        for kind in (2, 3):
+            p = self.write(f"v4k{kind}.mmm", mmm4_encode(SEED, b"\x11" * 32, kind, family_hex="ab" * 8))
+            with self.assertRaisesRegex(w.WalletError, "unsupported kind"):
+                w.read_seed(p)
+
+
+FACTOR = bytes(range(32))
+FAMILY = hashlib.sha256(b"xcoin-mmm-family" + FACTOR).hexdigest()[:16]
+UID = "04a1b2c3d4e580"
+CARDS = [{"uid": UID, "family": FAMILY, "label": "primary", "read_key_no": 2, "read_key": "00" * 16}]
+
+
+class TestMmm5Format(DexFormatBase):
+    """XCOINMMM5 (dex-wallet-era one-file card wallet) opens read-only: passphrase
+    opens the card records, then the tap supplies the factor. The card layer is
+    monkeypatched — no hardware; Mmm5CardStore.load is still exercised for real."""
+    def make_wallet(self, pw="pw123"):
+        blob = mmm5_encode(FAMILY, CARDS, pw, SEED, FACTOR)
+        return self.write("wallet003.mmm", blob), blob
+    def patch_card(self, factor):
+        taps = []
+        class FakeFactor:
+            def __init__(s, b): s._b = b
+            def bytes(s): return s._b
+            def close(s): s._b = b""
+        def read_factor(transport, store=None):
+            taps.append(store.load(UID))                      # the real Mmm5CardStore
+            return FakeFactor(factor), taps[-1]
+        fake = types.SimpleNamespace(
+            disable_core_dumps=lambda: None,
+            PCSCTransport=lambda: types.SimpleNamespace(close=lambda: None),
+            read_factor=read_factor,
+            family_of=lambda b: hashlib.sha256(b"xcoin-mmm-family" + b).hexdigest()[:16])
+        real = w._card_module; w._card_module = lambda: fake
+        self.addCleanup(setattr, w, "_card_module", real)
+        return taps
+    def test_unlock_with_card_and_passphrase(self):
+        from contextlib import redirect_stderr
+        p, _ = self.make_wallet()
+        taps = self.patch_card(FACTOR)
+        self.use_passphrase("pw123"); self.no_prompt()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(w.read_seed(p), SEED)
+        self.assertEqual(len(taps), 1)
+        self.assertEqual(taps[0]["uid"], UID)
+        self.assertIn("Tap your wallet card", err.getvalue())  # prompt on stderr, stdout stays JSON-clean
+    def test_wrong_passphrase_fails_before_any_tap(self):
+        p, _ = self.make_wallet()
+        taps = self.patch_card(FACTOR)
+        self.use_passphrase("nope"); self.no_prompt()
+        with self.assertRaisesRegex(w.WalletError, "wrong passphrase"):
+            w.read_seed(p)
+        self.assertEqual(taps, [])
+    def test_empty_passphrase_errors_early(self):
+        p, _ = self.make_wallet()
+        taps = self.patch_card(FACTOR)
+        self.use_passphrase(""); self.no_prompt()
+        with self.assertRaisesRegex(w.WalletError, "needs its passphrase"):
+            w.read_seed(p)
+        self.assertEqual(taps, [])
+    def test_no_terminal_no_passphrase(self):
+        p, _ = self.make_wallet()
+        self.patch_card(FACTOR); self.no_prompt()
+        with self.assertRaisesRegex(w.WalletError, "no terminal"):
+            w.read_seed(p)
+    def test_wrong_factor_is_family_mismatch(self):
+        from contextlib import redirect_stderr
+        p, _ = self.make_wallet()
+        self.patch_card(b"\xff" * 32)                         # a different card's factor
+        self.use_passphrase("pw123"); self.no_prompt()
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(w.WalletError, "family mismatch"):
+                w.read_seed(p)
+    def test_wrong_factor_honest_message(self):
+        _, blob = self.make_wallet()
+        with self.assertRaisesRegex(w.WalletError, r"wrong card \(or passphrase\)"):
+            w.mmm5_seed(blob, b"\xff" * 32, "pw123")
+    def test_seed_never_revealed_for_card_wallet(self):
+        p, _ = self.make_wallet()
+        self.assertTrue(w.is_card_wallet(p))
+
+
+class TestWalletsList(unittest.TestCase):
+    """`wallets` lists ~/.xcoin AND ~/.dex-wallet candidates with per-file format
+    (sniffed from the magic) and a card flag; the default star keeps the
+    default_wallet() precedence (~/.xcoin only). Never prompts."""
+    def list_rows(self, fake_home):
+        import unittest.mock as mock
+        with mock.patch.object(w.Path, "home", staticmethod(lambda: fake_home)):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = w.main(["--json", "wallets"])
+            self.assertEqual(rc, 0)
+            return json.loads(buf.getvalue())
+    def test_lists_both_dirs_with_formats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            d = fake_home / ".xcoin"; d.mkdir()
+            (d / "wallet.mmm").write_bytes(w.mmm_encode(SEED, ""))
+            (d / "cold.mmm").write_bytes(w.mmm2_encode(SEED, b"\x11" * 32, "ab" * 8))
+            (d / "wallet.seed").write_text("ab" * 32)
+            x = fake_home / ".dex-wallet"; x.mkdir()
+            (x / "wallet.mmm").write_bytes(mmm4_encode(SEED, b"pw", 1))
+            (x / "wallet003.mmm").write_bytes(mmm5_encode(FAMILY, CARDS, "pw", SEED, FACTOR))
+            rows = self.list_rows(fake_home)
+        self.assertEqual([r["name"] for r in rows],
+                         ["cold.mmm", "wallet.mmm", "wallet.seed", "wallet.mmm", "wallet003.mmm"])
+        self.assertEqual([r["format"] for r in rows], ["mmm2", "mmm1", "seed", "mmm4", "mmm5-card"])
+        self.assertEqual([r["card"] for r in rows], [True, False, False, False, True])
+        self.assertEqual([r["default"] for r in rows], [False, True, False, False, False])
+        self.assertTrue(rows[3]["file"].endswith(".dex-wallet/wallet.mmm"))
+    def test_missing_dex_dir_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            d = fake_home / ".xcoin"; d.mkdir()
+            (d / "wallet.mmm").write_bytes(w.mmm_encode(SEED, ""))
+            rows = self.list_rows(fake_home)
+        self.assertEqual([(r["name"], r["format"], r["card"], r["default"]) for r in rows],
+                         [("wallet.mmm", "mmm1", False, True)])

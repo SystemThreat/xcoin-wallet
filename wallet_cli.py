@@ -104,9 +104,8 @@ def mmm2_decode(blob, factor_bytes, passphrase=""):
     return bytes(a ^ b for a, b in zip(ct, stream)).hex()
 
 def is_card_wallet(path):
-    try:
-        with open(path, "rb") as f: return f.read(len(MMM2_MAGIC)) == MMM2_MAGIC
-    except OSError: return False
+    """True for every card-bound format: mmm2, and the dex-era mmm3/mmm5 and card-kind mmm4."""
+    return _wallet_format(path)[1]
 
 def mmm_encode(seed_hex, passphrase):
     payload = bytes.fromhex(seed_hex)
@@ -129,6 +128,146 @@ def mmm_decode(blob, passphrase):
 
 def _valid_seed(seed):
     return len(seed) in range(64, 129, 2) and all(c in "0123456789abcdef" for c in seed.lower())
+
+# --- dex-wallet-era formats (XCOINMMM3/4/5): READ/UNLOCK-ONLY ----------------
+# Ported from dex-wallet-cli/wallet_cli.py so this CLI (and the MMM app that
+# shells out to it) can OPEN those wallets; dex-wallet-cli remains the writer.
+# v4: XCOINMMM4\n | kind(1: 1=passphrase,2=card,3=namelock) | [family(8) iff card kind]
+#     | salt(16) | nonce(16) | ct | hmac(32); payload = 0x04 | seed_len(1) | seed(32-64) | slh_seed(48)
+# v5: XCOINMMM5\n | kind 0x02 | family(8) | u16be len(A) | A | B
+#     A = seal(passphrase, "XCOINMMM5A", json card key records)
+#     B = seal(factor + passphrase, "XCOINMMM5B", v4 payload)
+# Key material is the SAME scrypt as v1/v2 above (dex's SCRYPT_N/R/P are also
+# 2^15/8/1, verified against its source); encrypt-then-MAC over the whole body.
+MMM3_MAGIC = b"XCOINMMM3\n"   # v3: card-bound, FILENAME-locked (dex-only; not unlocked here)
+MMM4_MAGIC = b"XCOINMMM4\n"   # v4: any kind; master seed + SLH-DSA seed (dex `new` wrote passphrase kind only)
+MMM5_MAGIC = b"XCOINMMM5\n"   # v5: ONE-FILE card wallet (card key records live in the file)
+MMM5A, MMM5B = b"XCOINMMM5A", b"XCOINMMM5B"
+KIND_PASSPHRASE, KIND_CARD, KIND_NAMELOCK = 1, 2, 3
+PAYLOAD_VERSION = 4
+
+# HD derivation up to the SLH seed (pure hashing, ported verbatim from
+# dex-wallet-cli/wallet_cli.py; must match src/pqhd.h and the keytool).
+PQ_MASTER_DOMAIN = b"NEX-PQ-MASTER"
+PQ_CHILD_DOMAIN = b"NEX-PQ-CHILD"
+XCOIN_HD_SLH_SEED_DOMAIN = b"xcoin/hd/slh-dsa-sha2-128s/seed"
+SLH_SEED_SIZE = 48
+
+def child_seed(seed_hex, index):
+    """SHAKE-256(SHAKE-256(seed || "NEX-PQ-MASTER")[32] || u32le(index) || "NEX-PQ-CHILD")[32]:
+    the ML-DSA-65 KeyGen seed of key index `index` (the first chain's derivation, frozen)."""
+    master = hashlib.shake_256(bytes.fromhex(seed_hex) + PQ_MASTER_DOMAIN).digest(32)
+    return hashlib.shake_256(master + index.to_bytes(4, "little") + PQ_CHILD_DOMAIN).digest(32)
+
+def slh_seed_from_child(child):
+    """SHAKE-256(child32 || "xcoin/hd/slh-dsa-sha2-128s/seed")[48]: the node's DeriveXcoinSLHSeed."""
+    return hashlib.shake_256(child + XCOIN_HD_SLH_SEED_DOMAIN).digest(SLH_SEED_SIZE)
+
+def slh_seed(seed_hex, index): return slh_seed_from_child(child_seed(seed_hex, index))
+
+def _unseal(secret, blob, body_offset, min_ct, max_ct, wrong):
+    """Ported verbatim from dex-wallet-cli (its _seal counterpart is write-side, not here)."""
+    if len(blob) < body_offset + 16 + 16 + min_ct + 32: raise WalletError("corrupt .mmm wallet file")
+    salt, nonce = blob[body_offset:body_offset + 16], blob[body_offset + 16:body_offset + 32]
+    ct, mac = blob[body_offset + 32:-32], blob[-32:]
+    if not min_ct <= len(ct) <= max_ct: raise WalletError("corrupt .mmm wallet file")
+    enc_key, mac_key = _scrypt(secret, salt)
+    if not hmac.compare_digest(hmac.new(mac_key, blob[:-32], hashlib.sha256).digest(), mac):
+        raise WalletError(wrong)
+    stream = hashlib.shake_256(enc_key + nonce).digest(len(ct))
+    return bytes(a ^ b for a, b in zip(ct, stream))
+
+def parse_wallet_payload(payload):
+    """Return the master seed hex of a v4 payload after checking its SLH-DSA seed
+    (recomputed as slh_seed(seed, 0); a drifted derivation must never pass silently)."""
+    if len(payload) < 2 or payload[0] != PAYLOAD_VERSION: raise WalletError("unknown .mmm payload version")
+    n = payload[1]
+    if not 32 <= n <= 64 or len(payload) != 2 + n + SLH_SEED_SIZE: raise WalletError("corrupt .mmm payload")
+    seed_hex = payload[2:2 + n].hex()
+    if not hmac.compare_digest(payload[2 + n:], slh_seed(seed_hex, 0)):
+        raise WalletError("the SLH-DSA seed stored in this wallet does not match the one derived from its master seed "
+                          "(key derivation drift: do not spend with this build; re-vendor pqcrypto and rebuild)")
+    return seed_hex
+
+def wallet_header(blob):
+    """Describe any .mmm blob (ported verbatim from dex-wallet-cli): version, kind,
+    family (card wallets) and where salt/nonce/ct start."""
+    if blob.startswith(MMM4_MAGIC):
+        if len(blob) < 11: raise WalletError("corrupt .mmm wallet file")
+        kind = blob[10]
+        if kind == KIND_PASSPHRASE: return {"version": 4, "kind": kind, "family": None, "body": 11}
+        if kind in (KIND_CARD, KIND_NAMELOCK):
+            if len(blob) < 19: raise WalletError("corrupt .mmm wallet file")
+            return {"version": 4, "kind": kind, "family": blob[11:19].hex(), "body": 19}
+        raise WalletError("unknown .mmm wallet kind")
+    if blob.startswith(MMM3_MAGIC): return {"version": 3, "kind": KIND_NAMELOCK, "family": blob[10:18].hex(), "body": 18}
+    if blob.startswith(MMM2_MAGIC): return {"version": 2, "kind": KIND_CARD, "family": blob[10:18].hex(), "body": 18}
+    if blob.startswith(MMM_MAGIC): return {"version": 1, "kind": KIND_PASSPHRASE, "family": None, "body": 10}
+    return None
+
+def mmm4_decode(blob, secret_bytes):
+    h = wallet_header(blob)
+    if not h or h["version"] != 4: raise WalletError("not a v4 .mmm wallet file")
+    wrong = ("wrong passphrase (or corrupt .mmm wallet file)" if h["kind"] == KIND_PASSPHRASE
+             else "wrong card (or passphrase), or corrupt wallet file" if h["kind"] == KIND_CARD
+             else "corrupt .mmm wallet file")   # a wrong FILENAME looks exactly like corruption
+    return parse_wallet_payload(_unseal(secret_bytes, blob, h["body"], 2 + 32 + SLH_SEED_SIZE, 2 + 64 + SLH_SEED_SIZE, wrong))
+
+def mmm5_parts(blob):
+    if not blob.startswith(MMM5_MAGIC) or len(blob) < 21: raise WalletError("corrupt .mmm wallet file")
+    if blob[10] != KIND_CARD: raise WalletError("unknown .mmm wallet kind")
+    family = blob[11:19].hex()
+    la = int.from_bytes(blob[19:21], "big")
+    a, b = blob[21:21 + la], blob[21 + la:]
+    if len(a) != la or not a.startswith(MMM5A) or not b.startswith(MMM5B): raise WalletError("corrupt .mmm wallet file")
+    return family, a, b
+
+def mmm5_cards(blob, passphrase):
+    """The card key records, or WalletError('wrong passphrase…')."""
+    _, a, _ = mmm5_parts(blob)
+    raw = _unseal(passphrase.encode(), a, len(MMM5A), 2, 65536, "wrong passphrase (or corrupt .mmm wallet file)")
+    try:
+        cards = json.loads(raw.decode())
+    except ValueError:
+        raise WalletError("corrupt .mmm wallet file (card block)")
+    if not isinstance(cards, list): raise WalletError("corrupt .mmm wallet file (card block)")
+    return cards
+
+def mmm5_seed(blob, factor_bytes, passphrase):
+    _, _, b = mmm5_parts(blob)
+    return parse_wallet_payload(_unseal(factor_bytes + passphrase.encode(), b, len(MMM5B),
+                                        2 + 32 + SLH_SEED_SIZE, 2 + 64 + SLH_SEED_SIZE,
+                                        "wrong card (or passphrase), or corrupt wallet file"))
+
+class Mmm5CardStore:
+    """READ-ONLY view of card_seed's key store kept INSIDE the .mmm file (block A).
+    Adapted from dex-wallet-cli's MmmCardStore: unlock scope only, so the writing
+    half (save/update/atomic rewrite) is deliberately not ported."""
+    def __init__(self, path, passphrase):
+        self.path, self.pw = Path(path), passphrase
+        self.blob = self.path.read_bytes()
+        self.family, _, self.sealed_b = mmm5_parts(self.blob)
+        self.cards = mmm5_cards(self.blob, passphrase)
+    def exists(self, uid_hex): return any(c.get("uid") == uid_hex for c in self.cards)
+    def load(self, uid_hex):
+        for c in self.cards:
+            if c.get("uid") == uid_hex: return dict(c)
+        raise WalletError(f"card {uid_hex} does not belong to this wallet")
+
+def _head(path, n=32):
+    try:
+        with open(path, "rb") as f: return f.read(n)
+    except OSError: return None
+
+def _wallet_format(path):
+    """(format, card) by sniffing the file head: mmm1|mmm2|mmm3|mmm4|mmm5-card|seed."""
+    head = _head(path)
+    if head is None: return None, False
+    if head.startswith(MMM5_MAGIC): return "mmm5-card", True
+    try: h = wallet_header(head)
+    except WalletError: return "mmm4", False       # v4 magic, header truncated/unknown kind
+    if h is None: return "seed", False             # no magic: plaintext seed (or foreign) file
+    return f"mmm{h['version']}", h["kind"] in (KIND_CARD, KIND_NAMELOCK)
 
 # A passphrase reaches this process in exactly two ways: typed at the terminal, or
 # handed over a file descriptor by a parent program (--passphrase-fd N; NerdMiner
@@ -169,11 +308,17 @@ def unlock_passphrase_candidates():
     pw = supplied_passphrase()
     if pw is not None: yield pw
 
-def card_passphrase():
+def card_passphrase(required=False):
+    """required=True (v5 one-file card wallets): the passphrase also guards the card
+    keys kept in the file, so an empty one is refused early — exactly dex's rule."""
     pw = supplied_passphrase()
-    if pw is not None: return pw
-    if can_prompt(): return getpass.getpass("Card wallet passphrase (Enter if none): ")
-    return ""
+    if pw is None:
+        if not can_prompt():
+            if required: raise WalletError(f"card wallet: {NO_TERMINAL}; run it from a terminal or hand the passphrase over --passphrase-fd")
+            return ""
+        pw = getpass.getpass("Card wallet passphrase: " if required else "Card wallet passphrase (Enter if none): ")
+    if required and not pw: raise WalletError("a card wallet needs its passphrase")
+    return pw
 
 def read_seed_card(blob):
     """Unlock a card-bound wallet: tap the matching card, read its factor over
@@ -197,25 +342,64 @@ def read_seed_card(blob):
     finally:
         factor.close()
 
+def read_seed_mmm5(path, blob):
+    """Unlock a dex-era one-file card wallet (adapted from dex-wallet-cli's
+    read_seed_mmm5): passphrase first (it opens the card keys), then the tap
+    (the factor), then the seed. Factor and seed live in secure buffers."""
+    cs = _card_module(); cs.disable_core_dumps()
+    pw = card_passphrase(required=True)
+    store = Mmm5CardStore(path, pw)                       # wrong passphrase fails here, before any tap
+    print("Tap your wallet card on the reader…", file=sys.stderr)
+    transport = cs.PCSCTransport()
+    try:
+        factor, _auth = cs.read_factor(transport, store)
+    finally:
+        transport.close()
+    try:
+        if cs.family_of(factor.bytes()) != store.family:
+            raise WalletError("this card does not belong to this wallet (family mismatch)")
+        seed = mmm5_seed(blob, factor.bytes(), pw)
+        if not _valid_seed(seed): raise WalletError("decryption produced an invalid seed")
+        return seed.lower()
+    finally:
+        factor.close()
+
+def _read_seed_passphrase(blob, decode):
+    """The passphrase unlock loop (ported verbatim from dex-wallet-cli): a v4 SLH
+    derivation-drift error must surface, never read as one more wrong passphrase."""
+    for pw in unlock_passphrase_candidates():
+        try: seed = decode(blob, pw)
+        except WalletError as e:
+            if "drift" in str(e): raise
+            continue
+        if _valid_seed(seed): return seed.lower()
+    if not can_prompt():
+        raise WalletError(f"wallet is passphrase-protected and {NO_TERMINAL}; run it from a terminal or hand the passphrase over --passphrase-fd")
+    for _ in range(3):
+        try:
+            seed = decode(blob, getpass.getpass("Wallet passphrase: "))
+            if _valid_seed(seed): return seed.lower()
+        except WalletError as e:
+            if "drift" in str(e): raise
+            print(f"error: {e}", file=sys.stderr)
+    raise WalletError("could not unlock wallet")
+
 def read_seed(path):
     try: blob = Path(path).read_bytes()
     except FileNotFoundError: raise WalletError(f"no wallet at {path}; run `xcoin-wallet new`")
+    if blob.startswith(MMM5_MAGIC):
+        return read_seed_mmm5(path, blob)
+    if blob.startswith(MMM4_MAGIC):
+        if wallet_header(blob)["kind"] != KIND_PASSPHRASE:
+            # dex-wallet-cli's `new` only ever wrote passphrase-kind v4 (its card wallets are v5)
+            raise WalletError("this v4 wallet uses a card (unsupported kind here); unlock it with dex-wallet-cli")
+        return _read_seed_passphrase(blob, lambda b, pw: mmm4_decode(b, pw.encode()))
+    if blob.startswith(MMM3_MAGIC):
+        raise WalletError("this is a name-locked card wallet (XCOINMMM3); unlock it with dex-wallet-cli")
     if blob.startswith(MMM2_MAGIC):
         return read_seed_card(blob)
     if blob.startswith(MMM_MAGIC):
-        for pw in unlock_passphrase_candidates():
-            try: seed = mmm_decode(blob, pw)
-            except WalletError: continue
-            if _valid_seed(seed): return seed.lower()
-        if not can_prompt():
-            raise WalletError(f"wallet is passphrase-protected and {NO_TERMINAL}; run it from a terminal or hand the passphrase over --passphrase-fd")
-        for _ in range(3):
-            try:
-                seed = mmm_decode(blob, getpass.getpass("Wallet passphrase: "))
-                if _valid_seed(seed): return seed.lower()
-            except WalletError as e:
-                print(f"error: {e}", file=sys.stderr)
-        raise WalletError("could not unlock wallet")
+        return _read_seed_passphrase(blob, mmm_decode)
     try: seed = blob.decode().strip()
     except UnicodeDecodeError: raise WalletError("wallet seed file is invalid")
     if not _valid_seed(seed): raise WalletError("wallet seed file is invalid")
@@ -752,6 +936,8 @@ def cmd_card_backup(args):
     cs = _card_module(); cs.disable_core_dumps()
     p = Path(args.file)
     if not is_card_wallet(p): raise WalletError(f"{p} is not a card-bound wallet")
+    if _wallet_format(p)[0] != "mmm2":
+        raise WalletError("this is a dex-wallet-era card wallet (read-only here); make backup cards with dex-wallet-cli")
     want_family = mmm2_family(p.read_bytes())
     print("Step 1/2 — tap an EXISTING card for this wallet (to copy its key).", file=sys.stderr)
     t1 = cs.PCSCTransport()
@@ -1193,6 +1379,30 @@ def cmd_encrypt(args):
     print(f"Old PLAINTEXT seed moved to: {moved}")
     print("Verify the new wallet (e.g. `xcoin-wallet address`), then store that file offline or delete it yourself.")
 
+def cmd_wallets(args):
+    """List the wallet files in ~/.xcoin AND ~/.dex-wallet (dex-era formats open
+    read-only here): every *.mmm plus the legacy wallet.seed. The starred/default
+    entry is what commands use when no --file is given (same precedence as
+    default_wallet(): ~/.xcoin only). Sniffs headers only — never prompts."""
+    default = Path(default_wallet())
+    rows = []
+    for d in (Path.home() / ".xcoin", Path.home() / ".dex-wallet"):
+        if not d.exists(): continue
+        candidates = sorted(d.glob("*.mmm"))
+        legacy = d / "wallet.seed"
+        if legacy.exists(): candidates.append(legacy)
+        for f in candidates:
+            st = f.stat()
+            fmt, card = _wallet_format(f)
+            rows.append({"name": f.name, "file": str(f), "format": fmt, "card": card,
+                         "modified": int(st.st_mtime), "default": f == default})
+    if args.json: emit_json(rows); return
+    if not rows: print("No wallets in ~/.xcoin or ~/.dex-wallet — run `xcoin-wallet-cli new`."); return
+    home = str(Path.home())
+    for r in rows:
+        shown = r["file"].replace(home, "~", 1)
+        print(f"{'*' if r['default'] else ' '} {shown}  ({r['format']}{', card' if r['card'] else ''}, modified {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['modified']))})")
+
 def cmd_reset(args):
     src = Path(args.file); read_seed(src)
     if not args.yes: raise WalletError("reset requires --yes and --backup <path>")
@@ -1254,6 +1464,7 @@ def parser():
         q.add_argument("--paste", action="store_true", help="read the seed from the clipboard, then clear it (macOS)")
         q.add_argument("--from-file", help="read the seed from a file (e.g. a USB-stick backup)")
         q.set_defaults(fn=cmd_restore)
+    q = sub.add_parser("wallets", help="list wallet files in ~/.xcoin and ~/.dex-wallet (the * entry is the default)"); q.set_defaults(fn=cmd_wallets)
     q = sub.add_parser("backup", help="copy the wallet file somewhere safe"); q.add_argument("destination"); q.set_defaults(fn=cmd_backup)
     q = sub.add_parser("encrypt", help="convert to / re-key the encrypted .mmm wallet format"); q.set_defaults(fn=cmd_encrypt)
     q = sub.add_parser("signmessage", help="sign a one-line message with the key at --index (FIPS 204 ML-DSA-65); used by NerdMiner login")
