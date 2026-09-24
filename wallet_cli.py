@@ -4,6 +4,12 @@
 All money is handled as Decimal end-to-end (RPC responses are parsed with
 parse_float=Decimal and amounts are sent to the node as 8-decimal strings),
 so no float ever touches an amount that gets signed or broadcast.
+
+Addresses are witness v3 script trees. The receiving address of key index i is
+the protocol-standard two-leaf tree {ML-DSA-65 leaf 0xc0, SLH-DSA-SHA2-128s
+fallback leaf 0xc2}; the single-leaf tree {ML-DSA-65 leaf} of the same key (the
+"carried" form, which earlier builds printed as the address) is still scanned,
+counted and spent. Derivation and signing live in the native keytool.
 """
 
 import argparse, base64, getpass, hashlib, hmac, json, os, shutil, subprocess, sys, time, urllib.request, urllib.error
@@ -25,14 +31,20 @@ COINBASE_MATURITY = 1000         # every xCoin chain: COINBASE_MATURITY_MAINNET 
 PQ_SIGNATURE_SIZE = 3309         # ML-DSA-65 signature (pqkey.h)
 PQ_PUBKEY_SIZE = 1952            # ML-DSA-65 public key
 V3_LEAF_SIZE = 34                # PUSH32 <SHA-256(pubkey)> OP_CHECKSIG
-V3_CONTROL_SIZE = 33             # leaf version 0xc0 || SHA256("xcoin/v3/nokey")
+V3_CONTROL_ONE_LEAF = 33         # leaf version 0xc0 || SHA256("xcoin/v3/nokey"): carried single-leaf tree
+V3_CONTROL_TWO_LEAF = 65         # ... || SLH-DSA sibling leaf hash: the two-leaf tree (every new address)
 # Witness stack per v3 input, 4 items: count(1) + push(3)+pubkey + push(3)+sig
-# (bare, SIGHASH_DEFAULT) + push(1)+leaf script + push(1)+control block
-WITNESS_PER_INPUT = 1 + 3 + PQ_PUBKEY_SIZE + 3 + PQ_SIGNATURE_SIZE + 1 + V3_LEAF_SIZE + 1 + V3_CONTROL_SIZE
+# (bare, SIGHASH_DEFAULT) + push(1)+leaf script + push(1)+control block.
+WITNESS_V3_TWO_LEAF = 1 + 3 + PQ_PUBKEY_SIZE + 3 + PQ_SIGNATURE_SIZE + 1 + V3_LEAF_SIZE + 1 + V3_CONTROL_TWO_LEAF
+WITNESS_V3_CARRIED = 1 + 3 + PQ_PUBKEY_SIZE + 3 + PQ_SIGNATURE_SIZE + 1 + V3_LEAF_SIZE + 1 + V3_CONTROL_ONE_LEAF
+# Every input is budgeted as a two-leaf ML-DSA spend: exact for those, a 32-byte
+# overestimate for carried inputs (never an underpaid fee).
+WITNESS_PER_INPUT = WITNESS_V3_TWO_LEAF
 INPUT_BASE_SIZE = 36 + 1 + 4     # outpoint + empty scriptSig len + sequence
 OUTPUT_SIZE = 8 + 1 + 34         # value + script len + witness-v3 script
 DUST_CHANGE = Decimal("0.0001")  # change below the consensus output floor (MIN_OUTPUT_VALUE_SAT = 10,000 sat) is folded into the fee; below it the tx is bad-txout-below-min-value
 DEFAULT_MAX_FEE = Decimal("0.1")
+MAX_STANDARD_TX_WEIGHT = 400_000  # node policy.h: heavier transactions are never relayed or mined
 
 class WalletError(RuntimeError): pass
 
@@ -160,7 +172,8 @@ def child_seed(seed_hex, index):
     return hashlib.shake_256(master + index.to_bytes(4, "little") + PQ_CHILD_DOMAIN).digest(32)
 
 def slh_seed_from_child(child):
-    """SHAKE-256(child32 || "xcoin/hd/slh-dsa-sha2-128s/seed")[48]: the node's DeriveXcoinSLHSeed."""
+    """SHAKE-256(child32 || "xcoin/hd/slh-dsa-sha2-128s/seed")[48]: dex-wallet-cli's SLH seed (the
+    node's stage-B3 domain; the keytool derives the same bytes for the 0xc2 leaf of every address)."""
     return hashlib.shake_256(child + XCOIN_HD_SLH_SEED_DOMAIN).digest(SLH_SEED_SIZE)
 
 def slh_seed(seed_hex, index): return slh_seed_from_child(child_seed(seed_hex, index))
@@ -438,7 +451,7 @@ def parse_conf(path):
 
 # ── bech32m + local transaction tooling (for the --explorer backend) ─────────
 # The bech32m math is the chain's own (BIP-350); witness v3 programs are the
-# 32-byte single-leaf Merkle root the keytool derives.
+# 32-byte Merkle roots the keytool derives (two-leaf, or the carried single leaf).
 _B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 def _b32_polymod(values):
     GEN = (0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)
@@ -577,23 +590,34 @@ class ExplorerRPC:
             return {"isvalid": True, "witness_version": 3,
                     "scriptPubKey": (bytes([0x53, 0x20]) + dec[2]).hex()}
         if method == "scantxoutset":
-            # the caller hands us raw(<spk>); recover the address for the API
-            spk = params[1][0][4:-1]
-            if not (len(spk) == 68 and spk.startswith("5320")):
-                raise WalletError("explorer backend can only scan witness-v3 scripts")
-            data = _convertbits(bytes.fromhex(spk[4:]), 8, 5, True)
-            values = [3] + data
-            chk = _b32_polymod(_b32_hrp_expand(self._hrp) + values + [0]*6) ^ 0x2bc830a3
-            addr = self._hrp + "1" + "".join(_B32[v] for v in values) + "".join(_B32[(chk >> (5*(5-i))) & 31] for i in range(6))
-            out = self._get(f"/api/utxos/{addr}", timeout=timeout)
-            return {"success": True, "height": out.get("height"),
-                    "total_amount": out.get("total_amount"),
-                    "unspents": [{k: v for k, v in {
-                                  "txid": u["txid"], "vout": u["vout"],
-                                  "scriptPubKey": u["scriptPubKey"], "amount": u["amount"],
-                                  "coinbase": u.get("coinbase", False), "height": u.get("height"),
-                                  "confirmations": u.get("confirmations")}.items() if v is not None}
-                                 for u in out.get("utxos", [])]}
+            # The caller hands us raw(<spk>) descriptors (a key index's two-leaf AND
+            # carried scripts); recover each address for the API and merge. Both
+            # forms are OP_3 PUSH32 <root>, so one re-encoding covers them.
+            height, total, unspents, seen = None, Decimal(0), [], set()
+            for desc in params[1]:
+                spk = desc[4:-1] if desc.startswith("raw(") and desc.endswith(")") else ""
+                if not (len(spk) == 68 and spk.startswith("5320")):
+                    raise WalletError("explorer backend can only scan witness-v3 scripts")
+                data = _convertbits(bytes.fromhex(spk[4:]), 8, 5, True)
+                values = [3] + data
+                chk = _b32_polymod(_b32_hrp_expand(self._hrp) + values + [0]*6) ^ 0x2bc830a3
+                addr = self._hrp + "1" + "".join(_B32[v] for v in values) + "".join(_B32[(chk >> (5*(5-i))) & 31] for i in range(6))
+                out = self._get(f"/api/utxos/{addr}", timeout=timeout)
+                if not isinstance(out, dict) or not isinstance(out.get("utxos"), list):
+                    raise WalletError(f"explorer returned no UTXO list for {addr}")
+                if out.get("height") is not None: height = max(height or 0, int(out["height"]))
+                for u in out["utxos"]:
+                    key = (u["txid"], u["vout"])
+                    if key in seen: continue          # never count one output twice
+                    seen.add(key)
+                    total += Decimal(str(u["amount"]))
+                    unspents.append({k: v for k, v in {
+                        "txid": u["txid"], "vout": u["vout"],
+                        # the explorer's own script, so tag_kinds can cross-check it
+                        "scriptPubKey": str(u.get("scriptPubKey") or spk).lower(), "amount": u["amount"],
+                        "coinbase": u.get("coinbase", False), "height": u.get("height"),
+                        "confirmations": u.get("confirmations")}.items() if v is not None})
+            return {"success": True, "height": height, "total_amount": total, "unspents": unspents}
         if method == "getmempoolinfo":
             # the chain's relay floor: DEFAULT_MIN_RELAY_TX_FEE = 1,000 sat/kvB = 1 sat/vB
             return {"minrelaytxfee": Decimal("0.00001000")}
@@ -719,9 +743,12 @@ def backend_hrp(rpc, args=None):
 def derive_offline(seed, index, hrp="xpa"):
     """Derive address `index` with the native keytool — the seed never leaves this
     host or reaches the node. The seed goes to the tool over stdin (never argv).
-    Returns {address, identity, scriptPubKey, ...}: `address` is the witness v3
-    xpa1r…/txa1r… form, `identity` the forum handle xid1… of the same key (bech32m
-    over SHA-256(pubkey) with no witness version: a handle, nothing can be paid to it)."""
+    Returns {address, scriptPubKey, program, carried_address, carried_scriptPubKey,
+    carried_program, identity, ...}: `address` is the witness v3 xpa1r…/txa1r…
+    two-leaf tree {ML-DSA-65, SLH-DSA-SHA2-128s}, `carried_address` the single-leaf
+    {ML-DSA-65} tree of the same key (what earlier builds printed; still ours and
+    spendable), `identity` the forum handle xid1… of the same key (bech32m over
+    SHA-256(pubkey) with no witness version: a handle, nothing can be paid to it)."""
     tool = keytool_path()
     if not tool:
         raise WalletError("offline keytool not found: build the native keytool (`NEX=.. ./build.sh`) "
@@ -739,15 +766,39 @@ def derive_offline(seed, index, hrp="xpa"):
         raise WalletError("offline keytool returned no valid address")
     if not isinstance(info, dict) or not info.get("address") or not info.get("scriptPubKey") or not info.get("identity"):
         raise WalletError("offline keytool returned an incomplete address (rebuild it: `NEX=.. ./build.sh`)")
+    # A keytool from before the two-leaf upgrade prints the single-leaf tree as
+    # "address" and no carried_* fields: refuse it rather than mistake one form for the other.
+    if not info.get("carried_address") or not info.get("carried_scriptPubKey"):
+        raise WalletError("offline keytool predates two-leaf addresses (rebuild it: `NEX=.. ./build.sh`)")
     return info
 
 def derive(rpc, seed, index):
     """Address for key `index`, derived OFFLINE: the seed never reaches the node."""
     return derive_offline(seed, index, backend_hrp(rpc))
 
-def scan(rpc, script):
-    result = rpc.call("scantxoutset", ["start", [f"raw({script})"]], timeout=300)
+def scan(rpc, scripts):
+    """scantxoutset over raw(<scriptPubKey>) descriptors (one hex script or a list)."""
+    if isinstance(scripts, str): scripts = [scripts]
+    result = rpc.call("scantxoutset", ["start", [f"raw({s})" for s in scripts]], timeout=300)
     if not result or not result.get("success"): raise WalletError("UTXO scan failed")
+    return result
+
+def wallet_scripts(info):
+    """scriptPubKey hex -> kind for one key index: the two-leaf tree and the carried tree."""
+    return {info["scriptPubKey"]: "two_leaf", info["carried_scriptPubKey"]: "carried"}
+
+def tag_kinds(result, kinds):
+    """Tag each scanned UTXO with the form ("two_leaf" | "carried") of the script it
+    pays. A UTXO on neither script is not this key's and is dropped (a scan only
+    returns what was asked for; this guards a misbehaving backend)."""
+    unspents = []
+    for u in result.get("unspents", []):
+        spk = u.get("scriptPubKey")
+        kind = kinds.get(spk.lower()) if isinstance(spk, str) else None
+        if kind is None: continue
+        u["kind"] = kind
+        unspents.append(u)
+    result["unspents"] = unspents
     return result
 
 def require_seed(args): return read_seed(args.file)
@@ -808,6 +859,12 @@ def select_coins(mature, amount, feerate=None, fixed_fee=None):
     """
     selected, total = [], Decimal(0)
     for u in sorted(mature, key=lambda x: x["amount"], reverse=True):
+        if estimate_sizes(len(selected) + 1, 2)[1] * 4 > MAX_STANDARD_TX_WEIGHT:
+            have = sum((x["amount"] for x in mature), Decimal(0))
+            if have >= amount:
+                raise WalletError(f"one transaction can carry at most {len(selected)} inputs ({fmt(total)} from these UTXOs); "
+                                  f"send at most about {fmt(total)} now and the rest in another send")
+            break
         selected.append(u); total += u["amount"]
         fee = fixed_fee if fixed_fee is not None else fee_for(len(selected), 2, feerate)
         if total >= amount + fee:
@@ -819,8 +876,10 @@ def select_coins(mature, amount, feerate=None, fixed_fee=None):
     raise WalletError(f"insufficient spendable funds: have {fmt(total)}, need about {fmt(amount + fee)}")
 
 def wallet_scan(args):
+    """Derive key --index and scan BOTH of its scripts (two-leaf + carried) in one call."""
     rpc, seed = make_backend(args), require_seed(args); info = derive(rpc, seed, args.index)
-    return rpc, seed, info, scan(rpc, info["scriptPubKey"])
+    kinds = wallet_scripts(info)
+    return rpc, seed, info, tag_kinds(scan(rpc, list(kinds)), kinds)
 
 def maturity_note(immature):
     if not immature: return ""
@@ -1045,15 +1104,23 @@ def cmd_seed(args):
 
 def cmd_receive(args):
     # Address derivation is offline: no node, no RPC credentials needed.
-    # `address`/`receive` print the address; `--identity` (or the `identity`
-    # subcommand) prints the same key's forum handle xid1… instead.
+    # `address`/`receive` print the two-leaf address; `--carried` the single-leaf
+    # form of the same key; `--identity` (or the `identity` subcommand) the same
+    # key's forum handle xid1… instead.
     info = derive_offline(require_seed(args), args.index, resolve_hrp(args))
+    carried = getattr(args, "carried", False)
     if args.json:
-        emit_json({"address": info["address"], "identity": info["identity"], "index": args.index, "scriptPubKey": info["scriptPubKey"]}); return
-    print(info["identity"] if args.identity else info["address"])
+        emit_json({"address": info["address"], "identity": info["identity"], "index": args.index,
+                   "scriptPubKey": info["scriptPubKey"], "carried_address": info["carried_address"],
+                   "carried_scriptPubKey": info["carried_scriptPubKey"]}); return
+    print(info["identity"] if args.identity else info["carried_address"] if carried else info["address"])
     if args.verbose:
-        print(f"index: {args.index}\nscriptPubKey: {info['scriptPubKey']}")
-        print(f"address: {info['address']}" if args.identity else f"identity: {info['identity']}")
+        print(f"index: {args.index}\nscriptPubKey: {info['carried_scriptPubKey'] if carried and not args.identity else info['scriptPubKey']}")
+        if args.identity or carried: print(f"address: {info['address']}")
+        if not args.identity: print(f"identity: {info['identity']}")
+        if not carried: print(f"carried address (single-leaf, same key): {info['carried_address']}")
+        print("tree: {ML-DSA-65 leaf 0xc0} (carried single-leaf form)" if carried and not args.identity
+              else "tree: {ML-DSA-65 leaf 0xc0, SLH-DSA-SHA2-128s fallback leaf 0xc2}")
 
 def cmd_signmessage(args):
     """Sign a text message with the ML-DSA-65 key at --index, for a service that
@@ -1102,34 +1169,51 @@ def cmd_signmessage(args):
 def cmd_addresses(args):
     seed = require_seed(args)                  # offline derivation: no RPC needed
     rows = []
+    hrp = resolve_hrp(args)
     for i in range(args.start, args.start + args.count):
-        info = derive_offline(seed, i, resolve_hrp(args))
-        row = {"index": i, "address": info["address"]}
+        info = derive_offline(seed, i, hrp)
+        row = {"index": i, "address": info["address"], "carried_address": info["carried_address"]}
         if args.identity: row["identity"] = info["identity"]
         rows.append(row)
     if args.json: emit_json(rows); return
-    for r in rows: print(f"{r['index']:5d}  {r['address']}" + (f"  {r['identity']}" if args.identity else ""))
+    # one two-leaf address per line; --carried adds the single-leaf column, --identity the xid1… one
+    for r in rows: print(f"{r['index']:5d}  {r['address']}" + (f"  {r['carried_address']}" if args.carried else "")
+                         + (f"  {r['identity']}" if args.identity else ""))
+
+def form_totals(mature, immature, kind, address):
+    sp = sum((u["amount"] for u in mature if u["kind"] == kind), Decimal(0))
+    im = sum((u["amount"] for u in immature if u["kind"] == kind), Decimal(0))
+    return {"address": address, "spendable": sp, "immature": im, "total": sp + im,
+            "utxos": sum(1 for u in mature + immature if u["kind"] == kind),
+            "immature_utxos": sum(1 for u in immature if u["kind"] == kind)}
 
 def cmd_balance(args):
     _, _, info, result = wallet_scan(args)
     mature, immature = classify_utxos(result)
     spendable = sum((u["amount"] for u in mature), Decimal(0))
     pending = sum((u["amount"] for u in immature), Decimal(0))
-    data = {"address": info["address"], "index": args.index,
+    forms = {"two_leaf": form_totals(mature, immature, "two_leaf", info["address"]),
+             "carried": form_totals(mature, immature, "carried", info["carried_address"])}
+    data = {"address": info["address"], "carried_address": info["carried_address"], "index": args.index,
             "spendable": spendable, "immature": pending, "total": spendable + pending,
             "utxos": len(mature) + len(immature), "immature_utxos": len(immature),
-            "height": result.get("height")}
+            "height": result.get("height"), "forms": forms}
     if args.json: emit_json(data); return
     print(f"Address:       {info['address']}\nIndex:         {args.index}")
     print(f"Spendable:     {fmt(spendable)}")
     if immature:
         print(f"Immature:      {maturity_note(immature)}")
-    print(f"Total:         {fmt(spendable + pending)}\nUTXOs:         {data['utxos']}\nScan height:   {data['height']}")
+    print(f"Total:         {fmt(spendable + pending)}")
+    if forms["carried"]["utxos"]:
+        c, t = forms["carried"], forms["two_leaf"]
+        print(f"  two-leaf:    {fmt(t['total'])} in {t['utxos']} UTXO{'s' if t['utxos'] != 1 else ''}")
+        print(f"  carried:     {fmt(c['total'])} in {c['utxos']} UTXO{'s' if c['utxos'] != 1 else ''} on {info['carried_address']} (single-leaf, same key; spendable)")
+    print(f"UTXOs:         {data['utxos']}\nScan height:   {data['height']}")
 
 def cmd_utxos(args):
     _, _, _, result = wallet_scan(args)
     mature, immature = classify_utxos(result)
-    rows = [{"txid": u["txid"], "vout": u["vout"], "amount": u["amount"],
+    rows = [{"txid": u["txid"], "vout": u["vout"], "amount": u["amount"], "kind": u["kind"],
              "height": u.get("height"), "confirmations": u["confirmations"],
              "coinbase": bool(u.get("coinbase")), "spendable": u not in immature,
              **({"blocks_to_maturity": u["blocks_to_maturity"]} if u in immature else {})}
@@ -1138,6 +1222,7 @@ def cmd_utxos(args):
     if not rows: print("No unspent outputs."); return
     for r in rows:
         note = " coinbase" if r["coinbase"] else ""
+        if r["kind"] == "carried": note += " carried"
         if not r["spendable"]: note += f" IMMATURE ({r['blocks_to_maturity']} blocks left)"
         print(f"{r['txid']}:{r['vout']}  {fmt(r['amount'])}  height={r['height']} confs={r['confirmations']}{note}")
     print(f"Total: {fmt(sum(r['amount'] for r in rows))}  (spendable: {fmt(sum(r['amount'] for r in rows if r['spendable']))})")
@@ -1172,15 +1257,16 @@ def cmd_send(args):
         raise WalletError(f"fee {fmt(fee)} exceeds --max-fee {fmt(max_fee)}; pass a higher --max-fee to allow it")
 
     est_total, est_vsize = estimate_sizes(len(selected), 2 if change > 0 else 1)
+    n_carried = sum(1 for u in selected if u["kind"] == "carried")
     if not args.json:
         print("Transaction preview")
         print(f"  Chain:       {chain}")
-        print(f"  From:        {own['address']} (index {args.index})")
+        print(f"  From:        {own['address']} (index {args.index})" + (" + its carried single-leaf form" if n_carried else ""))
         print(f"  To:          {args.destination}")
         print(f"  Amount:      {fmt(amount)}")
         print(f"  Fee:         {fee_desc}")
         print(f"  Change:      {fmt(change)}")
-        print(f"  Inputs:      {len(selected)}  (~{est_total} bytes, ~{est_vsize} vbytes signed)")
+        print(f"  Inputs:      {len(selected)}" + (f" ({n_carried} carried)" if n_carried else "") + f"  (~{est_total} bytes, ~{est_vsize} vbytes signed)")
         print("  Signing:     OFFLINE keytool (seed stays here)")
         if immature: print(f"  Excluded:    {maturity_note(immature)}")
     if not args.yes:
@@ -1189,8 +1275,10 @@ def cmd_send(args):
         if answer != "SEND": raise WalletError("cancelled")
 
     outputs = [{args.destination: fmt8(amount)}]
-    if change > 0: outputs.append({own["address"]: fmt8(change)})
+    if change > 0: outputs.append({own["address"]: fmt8(change)})   # change always to the two-leaf address
     raw = rpc.call("createrawtransaction", [[{"txid": u["txid"], "vout": u["vout"]} for u in selected], outputs])
+    # Each prevout carries its own script (two-leaf or carried); the keytool matches it
+    # against the key's two trees and signs the ML-DSA leaf with the right control block.
     prev = [{"txid": u["txid"], "vout": u["vout"], "scriptPubKey": u["scriptPubKey"],
              "amount": u["amount"], "keyindex": args.index} for u in selected]
 
@@ -1203,7 +1291,7 @@ def cmd_send(args):
         local = parse_signed_tx(signed_hex)
         data = {"txid": local["txid"], "size": local["size"], "vsize": local["vsize"],
                 "fee": fee, "change": change, "signer": signer, "inputs": len(selected),
-                "mempool_accept": None, "broadcast": False}
+                "carried_inputs": n_carried, "mempool_accept": None, "broadcast": False}
         if args.dry_run:
             if args.json: emit_json(data); return
             print(f"Dry run: signed OK, NOT broadcast.\nTXID: {data['txid']}\nSigned bytes: {data['size']} ({data['vsize']} vbytes)")
@@ -1215,8 +1303,8 @@ def cmd_send(args):
         decoded = rpc.call("decoderawtransaction", [signed_hex])
         data = {"txid": decoded.get("txid"), "size": len(signed_hex) // 2,
                 "vsize": decoded.get("vsize"), "fee": fee, "change": change, "signer": signer,
-                "inputs": len(selected), "mempool_accept": bool(verdict.get("allowed")),
-                "broadcast": False}
+                "inputs": len(selected), "carried_inputs": n_carried,
+                "mempool_accept": bool(verdict.get("allowed")), "broadcast": False}
         if not verdict.get("allowed"):
             data["reject_reason"] = verdict.get("reject-reason", "unknown")
 
@@ -1235,7 +1323,7 @@ def cmd_send(args):
 
 def cmd_history(args):
     rpc, seed = make_backend(args), require_seed(args)
-    info = derive(rpc, seed, args.index); script = info["scriptPubKey"]
+    info = derive(rpc, seed, args.index); scripts = set(wallet_scripts(info))   # two-leaf + carried
     tip = rpc.call("getblockcount")
     events, my_outpoints = [], {}
     for h in range(args.from_height, tip + 1):
@@ -1247,7 +1335,7 @@ def cmd_history(args):
                 key = (vin.get("txid"), vin.get("vout"))
                 if key in my_outpoints: spent += my_outpoints.pop(key)
             for out in tx.get("vout", []):
-                if out.get("scriptPubKey", {}).get("hex") == script:
+                if out.get("scriptPubKey", {}).get("hex") in scripts:
                     amt = money(out["value"])
                     received += amt; my_outpoints[(tx["txid"], out["n"])] = amt
             if received or spent:
@@ -1258,15 +1346,15 @@ def cmd_history(args):
         try: tx = rpc.call("getrawtransaction", [txid, 1])
         except WalletError: continue
         received = sum((money(o["value"]) for o in tx.get("vout", [])
-                        if o.get("scriptPubKey", {}).get("hex") == script), Decimal(0))
+                        if o.get("scriptPubKey", {}).get("hex") in scripts), Decimal(0))
         spent = sum((my_outpoints[(v.get("txid"), v.get("vout"))] for v in tx.get("vin", [])
                      if (v.get("txid"), v.get("vout")) in my_outpoints), Decimal(0))
         if received or spent:
             events.append({"txid": txid, "height": None, "time": None, "received": received,
                            "spent": spent, "net": received - spent, "coinbase": False, "confirmations": 0})
-    if args.json: emit_json({"address": info["address"], "index": args.index, "tip": tip, "events": events}); return
-    if not events: print(f"No transactions for {info['address']}"); return
-    print(f"History for {info['address']} (index {args.index}, tip {tip})")
+    if args.json: emit_json({"address": info["address"], "carried_address": info["carried_address"], "index": args.index, "tip": tip, "events": events}); return
+    if not events: print(f"No transactions for {info['address']} (or its carried form)"); return
+    print(f"History for {info['address']} (index {args.index}, tip {tip}; includes the carried address)")
     for e in events:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["time"])) if e["time"] else "mempool         "
         where = f"{e['height']:>7}" if e["height"] is not None else "unconf."
@@ -1441,13 +1529,15 @@ def parser():
     for name, fn in (("receive", cmd_receive), ("address", cmd_receive)):
         q = sub.add_parser(name, help="show a receiving address"); q.add_argument("--index", type=int, default=0); q.add_argument("--verbose", action="store_true")
         q.add_argument("--identity", action="store_true", help="show the key's forum identity (xid1…) instead: a chat handle, nothing can be paid to it")
+        q.add_argument("--carried", action="store_true", help="show the single-leaf (carried) form of the same key instead of the two-leaf address")
         q.set_defaults(fn=fn)
     q = sub.add_parser("identity", help="show the forum identity (xid1…) of the key at --index; same as `address --identity`")
     q.add_argument("--index", type=int, default=101, help="key index (the forum identity convention is 101)"); q.add_argument("--verbose", action="store_true"); q.set_defaults(fn=cmd_receive, identity=True)
     q = sub.add_parser("addresses", help="list derived addresses"); q.add_argument("--start", type=int, default=0); q.add_argument("--count", type=int, default=5)
-    q.add_argument("--identity", action="store_true", help="also list each key's forum identity (xid1…)"); q.set_defaults(fn=cmd_addresses)
+    q.add_argument("--identity", action="store_true", help="also list each key's forum identity (xid1…)")
+    q.add_argument("--carried", action="store_true", help="also list each key's single-leaf (carried) address"); q.set_defaults(fn=cmd_addresses)
     for name, fn in (("balance", cmd_balance), ("status", cmd_balance), ("utxos", cmd_utxos)):
-        q = sub.add_parser(name, help="show balance/UTXOs (maturity-aware)"); q.add_argument("--index", type=int, default=0); q.set_defaults(fn=fn)
+        q = sub.add_parser(name, help="show balance/UTXOs (maturity-aware; two-leaf and carried outputs)"); q.add_argument("--index", type=int, default=0); q.set_defaults(fn=fn)
     q = sub.add_parser("send", help="send XCF (fee auto-estimated unless --fee)")
     q.add_argument("destination"); q.add_argument("amount")
     q.add_argument("--fee", help="absolute fee in XCF (overrides --feerate)")
@@ -1468,7 +1558,7 @@ def parser():
     q = sub.add_parser("backup", help="copy the wallet file somewhere safe"); q.add_argument("destination"); q.set_defaults(fn=cmd_backup)
     q = sub.add_parser("encrypt", help="convert to / re-key the encrypted .mmm wallet format"); q.set_defaults(fn=cmd_encrypt)
     q = sub.add_parser("signmessage", help="sign a one-line message with the key at --index (FIPS 204 ML-DSA-65); used by NerdMiner login")
-    q.add_argument("--template", help="message with {address} standing for the signer's name: its forum identity xid1… (default) or, with --as address, its xpa1z… address")
+    q.add_argument("--template", help="message with {address} standing for the signer's name: its forum identity xid1… (default) or, with --as address, its xpa1r… two-leaf address")
     q.add_argument("--message", help="literal message (no substitution)")
     q.add_argument("--index", type=int, default=101, help="key index (the forum identity convention is 101)")
     q.add_argument("--as", dest="sign_as", choices=("identity", "address"), default="identity",

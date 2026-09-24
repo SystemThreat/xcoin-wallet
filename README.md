@@ -2,9 +2,11 @@
 
 A minimal, auditable **post-quantum** command-line wallet for xCoin (XCF).
 
-Every Xcoin address is an **ML-DSA-65** (FIPS 204, quantum-resistant) key. Addresses
-look like `xpa1r…` (`txa1r…` on testnet A). There is no non-quantum spend path — coins
-can only be moved with a real ML-DSA-65 signature.
+Every Xcoin address is a witness v3 script tree over **post-quantum keys only**: an
+**ML-DSA-65** (FIPS 204) leaf plus an **SLH-DSA-SHA2-128s** (FIPS 205, hash-based)
+fallback leaf from the same key position. Addresses look like `xpa1r…` (`txa1r…` on
+testnet A). There is no non-quantum spend path — coins can only be moved with a real
+post-quantum signature (this wallet signs through the ML-DSA-65 leaf).
 
 > **What works today: everything.** Identity and forum sign-in (`identity`,
 > `signmessage` — the `xid1…` key at index 101 that minedifferent.com verifies),
@@ -39,8 +41,9 @@ the keytool is their replacement, and keys never touch the node.
 ## Build & install
 
 Requires Xcode Command Line Tools on an Apple Silicon Mac. The repository is
-standalone: the PQClean ML-DSA-65 sources are vendored in `pqcrypto/`, so a fresh
-clone builds with no other tree present. If you do have the xCoin node source,
+standalone: the node's PQClean ML-DSA-65 and SLH-DSA-SHA2-128s sources are vendored in
+`pqcrypto/` (provenance in `pqcrypto/*/PQCLEAN`), so a fresh clone builds with no other
+tree present. If you do have the xCoin node source,
 `NEX=/path/to/it ./build.sh` builds against the node's copy instead, so wallet and
 node can never drift.
 
@@ -82,13 +85,13 @@ Global options: `--file <wallet>`, `--config <nex.conf>`, `--rpc-host/-port/-use
 | Command | What it does |
 |---|---|
 | `new [--offline] [--no-clear]` | Create a wallet; prints the seed once, then offers a screen+scrollback wipe. |
-| `address` / `receive [--index N] [--verbose] [--identity]` | Show a receiving address; `--identity` shows the key's forum identity (`xid1…`) instead. |
+| `address` / `receive [--index N] [--verbose] [--identity] [--carried]` | Show the receiving (two-leaf) address; `--carried` shows the single-leaf form of the same key, `--identity` the key's forum identity (`xid1…`) instead. `--json` includes both address forms. |
 | `identity [--index N] [--verbose]` | Show the forum identity `xid1…` of the key at `--index` (same as `address --identity`). |
-| `addresses [--start N] [--count N] [--identity]` | List derived addresses; `--identity` lists each key's `xid1…` beside it. |
+| `addresses [--start N] [--count N] [--identity] [--carried]` | List derived (two-leaf) addresses, one per line; `--carried` adds each key's single-leaf form, `--identity` its `xid1…`. |
 | `signmessage --template T \| --message M [--index N] [--as identity\|address]` | Sign a message with the key at `--index` (FIPS 204 ML-DSA-65) for the MineDifferent sign-in; `{address}` in the template names the signer. |
-| `balance` / `status [--index N]` | Balance split into **spendable** vs **immature** (coinbase < 1,000 confs). |
-| `utxos [--index N]` | Every UTXO with height, confirmations, and maturity status. |
-| `send <dest> <amount> [--index N] [--fee X \| --feerate R] [--max-fee X] [--yes] [--dry-run]` | Select coins, estimate fee, sign with ML-DSA, confirm, broadcast. |
+| `balance` / `status [--index N]` | Balance split into **spendable** vs **immature** (coinbase < 1,000 confs), over both address forms of the key; `--json` adds a per-form breakdown (`forms.two_leaf`, `forms.carried`). |
+| `utxos [--index N]` | Every UTXO with height, confirmations, maturity status and form (`two_leaf` / `carried`). |
+| `send <dest> <amount> [--index N] [--fee X \| --feerate R] [--max-fee X] [--yes] [--dry-run]` | Select coins from both forms, estimate fee, sign with ML-DSA, confirm, broadcast; change goes to the two-leaf address. |
 | `history [--index N] [--from-height H]` | Full send/receive history (scans the chain; includes mempool). |
 | `info` | Chain, sync state, peers, mempool, and relay-fee status. |
 | `seed [--copy [--timeout S]] [--yes]` | Re-display the seed (type `REVEAL`) or copy it to the clipboard. |
@@ -101,6 +104,39 @@ Global options: `--file <wallet>`, `--config <nex.conf>`, `--rpc-host/-port/-use
 | `encrypt` | Convert a legacy plaintext `wallet.seed` to `.mmm`, or re-key an existing `.mmm`. |
 | `backup <dest>` | Copy the wallet file somewhere safe (0600); `.mmm` backups stay encrypted. |
 | `reset --backup <dest> --yes` | Retire the wallet — **moves** the seed to the backup path, never deletes. |
+
+### Addresses: two-leaf standard, carried form still yours
+
+The receiving address of key index `i` is the protocol-standard **two-leaf** witness v3
+tree, the same shape the node's own wallet hands out (`pqtr({pq(K),slh(K')})`,
+REGENESIS.md section 4):
+
+| Leaf | Version | Script |
+|---|---|---|
+| ML-DSA-65 | `0xc0` | `<SHA-256(ML-DSA pubkey)> OP_CHECKSIG` |
+| SLH-DSA-SHA2-128s (fallback) | `0xc2` | `<SLH-DSA pubkey (32 B)> OP_CHECKSIG` |
+
+The program is the sorted `XCoinBranch` of the two leaf hashes. Both keys come from
+the same seed position: the ML-DSA-65 key exactly as before, the SLH-DSA key from
+`SHAKE-256(child || "xcoin/hd/slh-dsa-sha2-128s/seed")[48]` (the same derivation as
+dex-wallet-cli, so both tools show the same address for the same seed and index).
+The wallet spends through the ML-DSA leaf; the SLH-DSA leaf is a hash-based fallback
+should ML-DSA ever be weakened.
+
+Earlier builds of this wallet printed the **single-leaf** tree `{ML-DSA-65 leaf}` of the
+same key as the address. That form is now called **carried**: it is still derived, still
+scanned by `balance`/`utxos`/`history`, and still spent by `send` (inputs of both forms
+can mix in one transaction). Nothing needs to be moved; new payments and change simply
+go to the two-leaf address.
+
+```bash
+xcoin-wallet address                  # xpa1r…  (two-leaf: ML-DSA + SLH-DSA)
+xcoin-wallet address --carried        # xpa1r…  (single-leaf form of the same key)
+xcoin-wallet --json address           # both, with their scriptPubKeys
+```
+
+After upgrading, rebuild the keytool (`./build.sh`): the CLI refuses a keytool that
+predates two-leaf addresses rather than mistake one form for the other.
 
 ### Forum identity (`xid1…`)
 
@@ -117,8 +153,9 @@ xcoin-wallet addresses --count 3 --identity    # index  xpa1r…  xid1…
 
 `signmessage` signs **as the identity** by default: `{address}` in the template and the
 JSON `address` field are the `xid1…` string (NerdMiner posts that field to the forum as
-`address`); `identity` and `witness_v2_address` are always in the JSON. `--as address`
-names the witness v3 payment address instead, for a verifier that expects one.
+`address`); `identity` and `witness_address` (the two-leaf payment address) are always
+in the JSON. `--as address` names the witness v3 payment address instead, for a verifier
+that expects one.
 
 ### The `.mmm` wallet file
 
@@ -168,10 +205,12 @@ finished transaction.
 
 The keytool reimplements the consensus signing paths **offline, without the
 node**: witness v3 (the live chains' post-quantum script tree — tagged sighash
-per `src/script/xcoin_v3.h`, single ML-DSA leaf, bare SIGHASH_DEFAULT
-signature) and legacy witness v2 (BIP143-style, kept for sweeping private
-chains). `./xcoin-wallet _v3vectors` replays the node's golden test vectors so
-a drifted build fails loudly
+per `src/script/xcoin_v3.h`, the ML-DSA-65 leaf of either address form, bare
+SIGHASH_DEFAULT signature; the control block is 65 bytes for a two-leaf output and
+33 for a carried single-leaf one) and legacy witness v2 (BIP143-style, kept for
+sweeping private chains). `./xcoin-wallet _v3vectors` replays the node's golden
+test vectors, and the two-leaf and carried programs of a fixed test seed as
+dex-wallet-cli's keytool derives them, so a drifted build fails loudly
 
 For a true air gap: build the unsigned tx online, carry it to an offline machine holding
 the seed/cards, run the keytool there, and carry the signed hex back to broadcast.
@@ -349,7 +388,8 @@ The integration script never broadcasts and never modifies the wallet.
   value that gets signed.
 - Deterministic keys: the same seed always restores the same wallet — verified
   byte-for-byte against the derivation the node's former `pqderiveaddress` RPC used
-  (SHAKE256 HD path → ML-DSA-65 keygen → bech32m address).
+  (SHAKE256 HD path → ML-DSA-65 keygen), and against dex-wallet-cli's keytool for the
+  SLH-DSA-SHA2-128s key and the two-leaf / carried trees (`_v3vectors`).
 
 ## License
 
