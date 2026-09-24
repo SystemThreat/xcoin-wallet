@@ -153,12 +153,6 @@ static std::string bech32m_encode(const std::string& hrp, const std::vector<uint
     for (int i = 0; i < 6; i++) out += B32[(mod >> (5 * (5 - i))) & 31];
     return out;
 }
-// Witness v2 address xpa1z…: HRP "xpa", the version byte, then the 32-byte program.
-static std::string bech32m_address(const std::vector<uint8_t>& prog32) {
-    std::vector<uint8_t> data; data.push_back(WITVER);
-    for (uint8_t v : convertbits(prog32)) data.push_back(v);
-    return bech32m_encode(HRP, data);
-}
 // Forum identity xid1…: HRP "xid", NO witness version byte, then the 32-byte
 // program (SHA-256 of the public key, the same bytes the addresses commit to).
 // 62 chars: "xid1" + 52 data + 6 checksum. Without a version byte and under a
@@ -277,20 +271,75 @@ static void bip143_sighash(const Tx& tx, size_t nIn, const std::vector<uint8_t>&
     dsha256(pre, out);
 }
 
-// address + scriptPubKey from a public key
-static void address_from_pk(const std::vector<uint8_t>& pk, std::string& addr, std::string& spk, std::string& proghex) {
-    uint8_t prog[32];
-    CC_SHA256(pk.data(), (CC_LONG)pk.size(), prog);     // witness program = SHA-256(pubkey)
-    std::vector<uint8_t> p(prog, prog + 32);
-    addr = bech32m_address(p);
-    proghex = to_hex(prog, 32);
-    spk = "5220" + proghex;                              // OP_2 <32-byte push>
-}
+// Legacy witness-v2 address derivation was removed 2026-09-24: the live chains
+// (testnet A, and mainnet at genesis) accept only witness v3 outputs, so every
+// address this tool prints is v3. The v2 SIGNING path in cmd_sign remains, for
+// sweeping any pre-regenesis v2 coins on private chains.
 // forum identity (xid1…) from a public key: bech32m over SHA-256(pubkey), no witness version
 static std::string identity_from_pk(const std::vector<uint8_t>& pk) {
     uint8_t prog[32];
     CC_SHA256(pk.data(), (CC_LONG)pk.size(), prog);
     return bech32m_identity(std::vector<uint8_t>(prog, prog + 32));
+}
+
+// ── witness v3: the post-quantum script tree (single ML-DSA leaf) ─────────────
+// Byte-for-byte mirror of the node: src/script/xcoin_v3.h and interpreter.cpp
+// (Bip341SignatureMessage + XcoinV3TagSighash). Golden vectors from
+// src/test/xcoin_v3_tests.cpp are replayed by `_v3vectors`.
+static const uint8_t WITVER3       = 3;      // xpa1r… / txa1r…
+static const uint8_t XCOIN_LEAF_PQ = 0xc0;   // ML-DSA-65 leaf version
+static const char* TAG_LEAF           = "XCoinLeaf";
+static const char* TAG_BRANCH         = "XCoinBranch";
+static const char* TAG_SIGHASH_BIP341 = "TapSighash";       // step 1: the BIP-341 message
+static const char* TAG_SIGHASH_V3     = "XCoinSighash/v3";  // step 2: the xCoin wrap
+static const char* TAG_NOKEY          = "xcoin/v3/nokey";   // plain SHA-256, NOT tagged
+static std::string g_hrp = "xpa";           // --hrp txa (or XCOIN_HRP=txa) for testnet A
+
+static void ssha256(const uint8_t* d, size_t n, uint8_t out[32]) { CC_SHA256(d, (CC_LONG)n, out); }
+static void ssha256(const std::vector<uint8_t>& d, uint8_t out[32]) { ssha256(d.data(), d.size(), out); }
+// BIP-340 style tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg).
+static void tagged_hash(const char* tag, const std::vector<uint8_t>& msg, uint8_t out[32]) {
+    uint8_t th[32]; ssha256((const uint8_t*)tag, strlen(tag), th);
+    std::vector<uint8_t> pre; pre.reserve(64 + msg.size());
+    pre.insert(pre.end(), th, th + 32); pre.insert(pre.end(), th, th + 32);
+    pre.insert(pre.end(), msg.begin(), msg.end());
+    ssha256(pre, out);
+}
+// The everyday leaf script: PUSH32 <SHA-256(ML-DSA pubkey)> OP_CHECKSIG — 34 bytes.
+static std::vector<uint8_t> v3_leaf_script(const std::vector<uint8_t>& pk) {
+    uint8_t kh[32]; ssha256(pk, kh);
+    std::vector<uint8_t> sc; sc.reserve(34);
+    sc.push_back(0x20); sc.insert(sc.end(), kh, kh + 32); sc.push_back(0xac);   // OP_CHECKSIG
+    return sc;
+}
+// Leaf hash = TaggedHash("XCoinLeaf", leaf_version || compact(script len) || script).
+// A single-leaf tree's Merkle root IS the leaf hash — which makes it the v3 program.
+static void v3_leaf_hash(uint8_t leaf_version, const std::vector<uint8_t>& script, uint8_t out[32]) {
+    std::vector<uint8_t> m; m.push_back(leaf_version);
+    put_compact(m, script.size()); m.insert(m.end(), script.begin(), script.end());
+    tagged_hash(TAG_LEAF, m, out);
+}
+// Control block for the single-leaf spend: leaf version || SHA256("xcoin/v3/nokey") — 33 bytes.
+static std::vector<uint8_t> v3_control_block() {
+    std::vector<uint8_t> c{XCOIN_LEAF_PQ};
+    uint8_t nk[32]; ssha256((const uint8_t*)TAG_NOKEY, strlen(TAG_NOKEY), nk);
+    c.insert(c.end(), nk, nk + 32);
+    return c;
+}
+// Witness v3 address: HRP ("xpa" mainnet / "txa" testnet A), version byte 3, 32-byte program.
+static std::string bech32m_address_v3(const std::string& hrp, const uint8_t prog[32]) {
+    std::vector<uint8_t> data; data.push_back(WITVER3);
+    std::vector<uint8_t> p(prog, prog + 32);
+    for (uint8_t v : convertbits(p)) data.push_back(v);
+    return bech32m_encode(hrp, data);
+}
+// v3 address + scriptPubKey from a public key.
+static void address_v3_from_pk(const std::vector<uint8_t>& pk, const std::string& hrp,
+                               std::string& addr, std::string& spk, std::string& proghex) {
+    uint8_t prog[32]; v3_leaf_hash(XCOIN_LEAF_PQ, v3_leaf_script(pk), prog);
+    addr = bech32m_address_v3(hrp, prog);
+    proghex = to_hex(prog, 32);
+    spk = "5320" + proghex;                               // OP_3 <32-byte push>
 }
 
 // ── wallet file (seed at rest) ────────────────────────────────────────────────
@@ -376,6 +425,50 @@ static void usage() {
 // code path the node's former pqsignrawtransaction RPC used (removed 2026-09-14).
 struct PrevOut { uint8_t hash[32]; uint32_t vout; std::vector<uint8_t> spk; uint64_t amount; uint32_t keyindex; };
 
+// Precomputed single-SHA256 hashes over the whole transaction, exactly the
+// BIP-341 set (prevouts / spent amounts / spent scriptPubKeys / sequences /
+// outputs). Spent-output data must be in INPUT ORDER.
+struct V3TxHashes { uint8_t prevouts[32], amounts[32], scripts[32], sequences[32], outputs[32]; };
+static void v3_precompute(const Tx& tx, const std::vector<const PrevOut*>& byin, V3TxHashes& h) {
+    std::vector<uint8_t> t;
+    for (auto& in : tx.vin) { t.insert(t.end(), in.hash, in.hash + 32); put_u32le(t, in.vout); }
+    ssha256(t, h.prevouts); t.clear();
+    for (auto* p : byin) put_u64le(t, p->amount);
+    ssha256(t, h.amounts); t.clear();
+    for (auto* p : byin) { put_compact(t, p->spk.size()); t.insert(t.end(), p->spk.begin(), p->spk.end()); }
+    ssha256(t, h.scripts); t.clear();
+    for (auto& in : tx.vin) put_u32le(t, in.sequence);
+    ssha256(t, h.sequences); t.clear();
+    for (auto& o : tx.vout) { put_u64le(t, o.value); put_compact(t, o.spk.size()); t.insert(t.end(), o.spk.begin(), o.spk.end()); }
+    ssha256(t, h.outputs);
+}
+// The v3 sighash, SIGHASH_DEFAULT (0x00) only — the node wallet's own choice.
+// Step 1: TaggedHash("TapSighash", BIP-341 fields with ext_flag=1 (spend_type
+// 0x02, no annex), key_version 0x02 (ML-DSA), codeseparator 0xFFFFFFFF).
+// Step 2: TaggedHash("XCoinSighash/v3", step-1 message). The result IS the
+// message handed to ML-DSA-65 (FIPS 204 pure mode, empty context) — it is
+// never hashed again.
+static void v3_sighash(const Tx& tx, size_t nIn, const V3TxHashes& h, const uint8_t leafhash[32], uint8_t out[32]) {
+    std::vector<uint8_t> m;
+    m.push_back(0x00);                       // epoch
+    m.push_back(0x00);                       // hash_type = SIGHASH_DEFAULT
+    put_u32le(m, tx.version);
+    put_u32le(m, tx.locktime);
+    m.insert(m.end(), h.prevouts,  h.prevouts  + 32);
+    m.insert(m.end(), h.amounts,   h.amounts   + 32);
+    m.insert(m.end(), h.scripts,   h.scripts   + 32);
+    m.insert(m.end(), h.sequences, h.sequences + 32);
+    m.insert(m.end(), h.outputs,   h.outputs   + 32);
+    m.push_back(0x02);                       // spend_type = ext_flag(1)<<1 | annex(0)
+    put_u32le(m, (uint32_t)nIn);
+    m.insert(m.end(), leafhash, leafhash + 32);
+    m.push_back(0x02);                       // key_version: ML-DSA
+    put_u32le(m, 0xFFFFFFFF);                // no OP_CODESEPARATOR executed
+    uint8_t step1[32];
+    tagged_hash(TAG_SIGHASH_BIP341, m, step1);
+    tagged_hash(TAG_SIGHASH_V3, std::vector<uint8_t>(step1, step1 + 32), out);
+}
+
 static int cmd_sign() {
     std::string seedhex, txhex, line;
     if (!std::getline(std::cin, seedhex) || !std::getline(std::cin, txhex)) {
@@ -405,29 +498,54 @@ static int cmd_sign() {
     Tx tx;
     if (!parse_tx(raw, tx)) { fprintf(stderr,"sign: could not parse tx\n"); return 1; }
 
+    // Align prevouts to inputs first: the v3 sighash commits to every spent
+    // output (amounts + scriptPubKeys) in input order, not just the one signed.
+    std::vector<const PrevOut*> byin(tx.vin.size(), nullptr);
+    for (size_t i=0;i<tx.vin.size();i++) {
+        for (auto& p : prevs) if (p.vout==tx.vin[i].vout && memcmp(p.hash,tx.vin[i].hash,32)==0) { byin[i]=&p; break; }
+        if (!byin[i]) { fprintf(stderr,"sign: no prevout for input %zu\n", i); return 1; }
+    }
+    V3TxHashes v3h; bool v3ready=false;
+
     std::vector<std::vector<std::vector<uint8_t>>> witness(tx.vin.size());
     for (size_t i=0;i<tx.vin.size();i++) {
-        const PrevOut* pv=nullptr;
-        for (auto& p : prevs) if (p.vout==tx.vin[i].vout && memcmp(p.hash,tx.vin[i].hash,32)==0) { pv=&p; break; }
-        if (!pv) { fprintf(stderr,"sign: no prevout for input %zu\n", i); return 1; }
-        // witness-v2 PQ scriptPubKey must be OP_2 PUSH32 <program>
-        if (pv->spk.size()!=34 || pv->spk[0]!=0x52 || pv->spk[1]!=0x20) { fprintf(stderr,"sign: input %zu is not witness-v2 PQ\n", i); return 1; }
-
+        const PrevOut* pv=byin[i];
         std::vector<uint8_t> pk, sk;
         if (!derive_keypair(seed, pv->keyindex, pk, sk)) { fprintf(stderr,"sign: key derivation failed\n"); return 1; }
-        uint8_t prog[32]; CC_SHA256(pk.data(),(CC_LONG)pk.size(),prog);
-        if (memcmp(prog, pv->spk.data()+2, 32)!=0) { memset(sk.data(),0,sk.size()); fprintf(stderr,"sign: key at index %u does not control input %zu\n", pv->keyindex, i); return 1; }
 
-        uint8_t sighash[32];
-        bip143_sighash(tx, i, pv->spk, pv->amount, sighash);   // scriptCode == scriptPubKey here
-
-        std::vector<uint8_t> sig(PQ_SIG); size_t siglen=0;
-        int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(sig.data(),&siglen, sighash,32, sk.data());
-        memset(sk.data(),0,sk.size());
-        if (ret!=0) { fprintf(stderr,"sign: ML-DSA signing failed on input %zu\n", i); return 1; }
-        sig.resize(siglen); sig.push_back(0x01);               // trailing SIGHASH_ALL byte
-        witness[i].push_back(sig);
-        witness[i].push_back(pk);
+        if (pv->spk.size()==34 && pv->spk[0]==0x53 && pv->spk[1]==0x20) {
+            // witness v3 (OP_3 PUSH32): single ML-DSA leaf spend.
+            std::vector<uint8_t> leaf = v3_leaf_script(pk);
+            uint8_t leafhash[32]; v3_leaf_hash(XCOIN_LEAF_PQ, leaf, leafhash);
+            if (memcmp(leafhash, pv->spk.data()+2, 32)!=0) { memset(sk.data(),0,sk.size()); fprintf(stderr,"sign: key at index %u does not control input %zu\n", pv->keyindex, i); return 1; }
+            if (!v3ready) { v3_precompute(tx, byin, v3h); v3ready=true; }
+            uint8_t sighash[32]; v3_sighash(tx, i, v3h, leafhash, sighash);
+            std::vector<uint8_t> sig(PQ_SIG); size_t siglen=0;
+            int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(sig.data(),&siglen, sighash,32, sk.data());
+            memset(sk.data(),0,sk.size());
+            if (ret!=0 || siglen!=PQ_SIG) { fprintf(stderr,"sign: ML-DSA signing failed on input %zu\n", i); return 1; }
+            sig.resize(siglen);
+            // SIGHASH_DEFAULT: the bare 3,309-byte signature. An explicit 0x00
+            // hashtype byte is consensus-invalid (one encoding per sighash).
+            witness[i] = { pk, sig, leaf, v3_control_block() };
+        } else if (pv->spk.size()==34 && pv->spk[0]==0x52 && pv->spk[1]==0x20) {
+            // legacy witness v2 (OP_2 PUSH32): BIP143-style, kept for sweeping
+            // pre-regenesis coins on private chains. The live chains reject v2.
+            uint8_t prog[32]; CC_SHA256(pk.data(),(CC_LONG)pk.size(),prog);
+            if (memcmp(prog, pv->spk.data()+2, 32)!=0) { memset(sk.data(),0,sk.size()); fprintf(stderr,"sign: key at index %u does not control input %zu\n", pv->keyindex, i); return 1; }
+            uint8_t sighash[32];
+            bip143_sighash(tx, i, pv->spk, pv->amount, sighash);   // scriptCode == scriptPubKey here
+            std::vector<uint8_t> sig(PQ_SIG); size_t siglen=0;
+            int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(sig.data(),&siglen, sighash,32, sk.data());
+            memset(sk.data(),0,sk.size());
+            if (ret!=0) { fprintf(stderr,"sign: ML-DSA signing failed on input %zu\n", i); return 1; }
+            sig.resize(siglen); sig.push_back(0x01);               // trailing SIGHASH_ALL byte
+            witness[i].push_back(sig);
+            witness[i].push_back(pk);
+        } else {
+            memset(sk.data(),0,sk.size());
+            fprintf(stderr,"sign: input %zu is neither witness-v3 nor witness-v2 PQ\n", i); return 1;
+        }
     }
 
     // serialize signed tx (segwit format)
@@ -468,9 +586,10 @@ static int cmd_address_json(int argc, char** argv) {
     memset(seed.data(), 0, seed.size());
     if (!ok) { fprintf(stderr, "_address: key derivation failed\n"); return 1; }
     std::string addr, spk, prog;
-    address_from_pk(pk, addr, spk, prog);
-    printf("{\"address\":\"%s\",\"identity\":\"%s\",\"scriptPubKey\":\"%s\",\"pubkey_sha256\":\"%s\",\"index\":%u}\n",
-           addr.c_str(), identity_from_pk(pk).c_str(), spk.c_str(), prog.c_str(), index);
+    address_v3_from_pk(pk, g_hrp, addr, spk, prog);
+    uint8_t kh[32]; ssha256(pk, kh);
+    printf("{\"address\":\"%s\",\"identity\":\"%s\",\"scriptPubKey\":\"%s\",\"program\":\"%s\",\"pubkey_sha256\":\"%s\",\"index\":%u}\n",
+           addr.c_str(), identity_from_pk(pk).c_str(), spk.c_str(), prog.c_str(), to_hex(kh, 32).c_str(), index);
     return 0;
 }
 
@@ -516,7 +635,7 @@ static int cmd_signmsg(int argc, char** argv) {
     if (ret != 0 || siglen == 0 || siglen > sig.size()) { fprintf(stderr, "_signmsg: signing failed\n"); return 1; }
     sig.resize(siglen);
     std::string addr, spk, prog;
-    address_from_pk(pk, addr, spk, prog);
+    address_v3_from_pk(pk, g_hrp, addr, spk, prog);
     printf("{\"address\":\"%s\",\"identity\":\"%s\",\"pubkey\":\"%s\",\"sig\":\"%s\",\"index\":%u}\n",
            addr.c_str(), identity_from_pk(pk).c_str(), to_hex(pk.data(), pk.size()).c_str(), to_hex(sig.data(), sig.size()).c_str(), index);
     return 0;
@@ -532,9 +651,54 @@ static int cmd_verify() {
     return ret==0?0:1;
 }
 
+// Replay the node's golden vectors (src/test/xcoin_v3_tests.cpp). Prints one
+// line per vector; exits nonzero on any mismatch. Run by tests and build.sh.
+static int cmd_v3vectors() {
+    int fails = 0;
+    auto check = [&](const char* name, const uint8_t got[32], const char* want) {
+        std::string g = to_hex(got, 32);
+        if (g != want) { printf("FAIL %s: %s != %s\n", name, g.c_str(), want); fails++; }
+        else printf("ok   %s\n", name);
+    };
+    uint8_t nk[32]; ssha256((const uint8_t*)TAG_NOKEY, strlen(TAG_NOKEY), nk);
+    check("nokey", nk, "54b62806c9e55d19448216fc3426a3a04466fbc59c18238795cbbc9003330a65");
+    std::vector<uint8_t> s1{0x20}; for (uint8_t i = 1; i <= 32; i++) s1.push_back(i); s1.push_back(0xac);
+    uint8_t l1[32]; v3_leaf_hash(0xc0, s1, l1);
+    check("leaf-pq", l1, "50371c2936f8bfda05c69228affb83119c687ad8a477b1a18bd01c0a468902d6");
+    uint8_t l2[32]; v3_leaf_hash(0xc0, std::vector<uint8_t>{}, l2);
+    check("leaf-empty", l2, "e3bb8e8060cd8ae48c5e91228aa5c257cd5bb80ae1cf853f4dec66a042b1c2f9");
+    uint8_t l3[32]; v3_leaf_hash(0xc2, std::vector<uint8_t>{0x51}, l3);
+    check("leaf-slh", l3, "cb25e1b1ec8b174d327f1e6466c018383dd0e23860f6805cab1738dd65922adf");
+    auto branch = [&](const uint8_t a[32], const uint8_t b[32], uint8_t out[32]) {
+        std::vector<uint8_t> m;
+        const uint8_t* lo = memcmp(a, b, 32) <= 0 ? a : b;
+        const uint8_t* hi = lo == a ? b : a;
+        m.insert(m.end(), lo, lo + 32); m.insert(m.end(), hi, hi + 32);
+        tagged_hash(TAG_BRANCH, m, out);
+    };
+    uint8_t b12[32]; branch(l1, l2, b12);
+    check("branch12", b12, "2339dd5ab68ae3ec676b327297e620ce7f2f7e7eb594be396a12ce600df76845");
+    uint8_t b21[32]; branch(l2, l1, b21);
+    check("branch-sorted", b21, "2339dd5ab68ae3ec676b327297e620ce7f2f7e7eb594be396a12ce600df76845");
+    uint8_t b123[32]; branch(b12, l3, b123);
+    check("branch123", b123, "44546098ecf80a10fbf7441c650152021a8f099a8eb816d80a04e0f01df60687");
+    uint8_t z[32] = {0}, tg[32];
+    tagged_hash(TAG_SIGHASH_V3, std::vector<uint8_t>(z, z + 32), tg);
+    check("sighash-tag-zero", tg, "ca2115605609aa667201bcb32f4fb217d4a673fa026e8ba76adbf01dc4ed37cd");
+    std::vector<uint8_t> ctrl = v3_control_block();
+    if (ctrl.size() == 33 && ctrl[0] == 0xc0 && memcmp(ctrl.data() + 1, nk, 32) == 0) printf("ok   control-block\n");
+    else { printf("FAIL control-block\n"); fails++; }
+    return fails == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
+    for (int i = 2; i + 1 < argc; i++)
+        if (std::string(argv[i]) == "--hrp") g_hrp = argv[i + 1];
+    if (const char* e = getenv("XCOIN_HRP")) if (*e) g_hrp = e;
+    if (g_hrp != "xpa" && g_hrp != "txa") { fprintf(stderr, "error: --hrp must be xpa (mainnet) or txa (testnet A)\n"); return 1; }
     if (std::string(argv[1]) == "sign") return cmd_sign();
+    if (std::string(argv[1]) == "_v3vectors") return cmd_v3vectors();
     if (std::string(argv[1]) == "_sighash") return cmd_sighash();
     if (std::string(argv[1]) == "_verify") return cmd_verify();
     if (std::string(argv[1]) == "_address") return cmd_address_json(argc, argv);
@@ -547,6 +711,7 @@ int main(int argc, char** argv) {
         if (a == "--file" && i + 1 < argc) file = argv[++i];
         else if (a == "--seed" && i + 1 < argc) seedOpt = argv[++i];
         else if (a == "--index" && i + 1 < argc) index = (uint32_t)strtoul(argv[++i], nullptr, 10);
+        else if (a == "--hrp" && i + 1 < argc) ++i;   // consumed before dispatch
         else if (a.rfind("--", 0) != 0) arg = a;
     }
 
@@ -554,7 +719,7 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> pk;
         if (!derive_pubkey(seed, index, pk)) { fprintf(stderr, "%serror:%s key derivation failed\n", RED, R); return 1; }
         std::string addr, spk, prog;
-        address_from_pk(pk, addr, spk, prog);
+        address_v3_from_pk(pk, g_hrp, addr, spk, prog);
         print_address_block(addr, spk, index);
         printf("  %smining:%s use %s%s.yourRigName%s as the pool username to show a worker\n",
                DIM, R, B, addr.c_str(), R);

@@ -24,11 +24,14 @@ def default_wallet():
 COINBASE_MATURITY = 1000         # every xCoin chain: COINBASE_MATURITY_MAINNET in kernel/chainparams.cpp
 PQ_SIGNATURE_SIZE = 3309         # ML-DSA-65 signature (pqkey.h)
 PQ_PUBKEY_SIZE = 1952            # ML-DSA-65 public key
-# Witness stack per input: count(1) + push(3)+sig+sighashbyte + push(3)+pubkey
-WITNESS_PER_INPUT = 1 + 3 + (PQ_SIGNATURE_SIZE + 1) + 3 + PQ_PUBKEY_SIZE
+V3_LEAF_SIZE = 34                # PUSH32 <SHA-256(pubkey)> OP_CHECKSIG
+V3_CONTROL_SIZE = 33             # leaf version 0xc0 || SHA256("xcoin/v3/nokey")
+# Witness stack per v3 input, 4 items: count(1) + push(3)+pubkey + push(3)+sig
+# (bare, SIGHASH_DEFAULT) + push(1)+leaf script + push(1)+control block
+WITNESS_PER_INPUT = 1 + 3 + PQ_PUBKEY_SIZE + 3 + PQ_SIGNATURE_SIZE + 1 + V3_LEAF_SIZE + 1 + V3_CONTROL_SIZE
 INPUT_BASE_SIZE = 36 + 1 + 4     # outpoint + empty scriptSig len + sequence
-OUTPUT_SIZE = 8 + 1 + 34         # value + script len + witness-v2 script
-DUST_CHANGE = Decimal("0.00001") # change below this is folded into the fee
+OUTPUT_SIZE = 8 + 1 + 34         # value + script len + witness-v3 script
+DUST_CHANGE = Decimal("0.0001")  # change below the consensus output floor (MIN_OUTPUT_VALUE_SAT = 10,000 sat) is folded into the fee; below it the tx is bad-txout-below-min-value
 DEFAULT_MAX_FEE = Decimal("0.1")
 
 class WalletError(RuntimeError): pass
@@ -249,6 +252,199 @@ def parse_conf(path):
     except FileNotFoundError: pass
     return out
 
+# ── bech32m + local transaction tooling (for the --explorer backend) ─────────
+# The bech32m math is the chain's own (BIP-350); witness v3 programs are the
+# 32-byte single-leaf Merkle root the keytool derives.
+_B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+def _b32_polymod(values):
+    GEN = (0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = ((chk & 0x1ffffff) << 5) ^ v
+        for i in range(5):
+            if (top >> i) & 1: chk ^= GEN[i]
+    return chk
+def _b32_hrp_expand(hrp): return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+def _convertbits(data, frombits, tobits, pad):
+    acc = bits = 0; ret = []
+    maxv = (1 << tobits) - 1
+    for v in data:
+        if v < 0 or v >> frombits: return None
+        acc = (acc << frombits) | v; bits += frombits
+        while bits >= tobits:
+            bits -= tobits; ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits: ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+def bech32m_decode_address(addr, hrps=("xpa", "txa")):
+    """-> (hrp, witver, program bytes) or None."""
+    a = addr.strip()
+    if a != a.lower() and a != a.upper(): return None
+    a = a.lower()
+    if "1" not in a: return None
+    hrp, data = a.rsplit("1", 1)
+    if hrp not in hrps or len(data) < 7: return None
+    try: values = [_B32.index(c) for c in data]
+    except ValueError: return None
+    if _b32_polymod(_b32_hrp_expand(hrp) + values) != 0x2bc830a3: return None
+    prog = _convertbits(values[1:-6], 5, 8, False)
+    if prog is None: return None
+    return hrp, values[0], bytes(prog)
+def address_to_spk(addr, hrp):
+    dec = bech32m_decode_address(addr, hrps=(hrp,))
+    if not dec or dec[1] != 3 or len(dec[2]) != 32:
+        raise WalletError(f"destination is not a witness-v3 {hrp}1r… address")
+    return bytes([0x53, 0x20]) + dec[2]
+
+def _compactsize(n):
+    if n < 0xfd: return bytes([n])
+    if n <= 0xffff: return b"\xfd" + n.to_bytes(2, "little")
+    return b"\xfe" + n.to_bytes(4, "little")
+def build_unsigned_tx(inputs, outputs, locktime=0):
+    """inputs: [{"txid","vout"}], outputs: [(spk bytes, sats int)] -> raw hex.
+    version 2, RBF sequence 0xfffffffd — the node wallet's own defaults."""
+    b = bytearray()
+    b += (2).to_bytes(4, "little")
+    b += _compactsize(len(inputs))
+    for i in inputs:
+        b += bytes.fromhex(i["txid"])[::-1]
+        b += int(i["vout"]).to_bytes(4, "little")
+        b += b"\x00"
+        b += (0xFFFFFFFD).to_bytes(4, "little")
+    b += _compactsize(len(outputs))
+    for spk, sats in outputs:
+        b += int(sats).to_bytes(8, "little")
+        b += _compactsize(len(spk)) + spk
+    b += int(locktime).to_bytes(4, "little")
+    return bytes(b).hex()
+def parse_signed_tx(hexstr):
+    """-> {"txid", "vsize", "size"} computed locally (no node needed)."""
+    raw = bytes.fromhex(hexstr); pos = 0
+    def u32():
+        nonlocal pos; v = int.from_bytes(raw[pos:pos+4], "little"); pos += 4; return v
+    def cpt():
+        nonlocal pos; c = raw[pos]; pos += 1
+        if c < 0xfd: return c
+        n = {0xfd: 2, 0xfe: 4, 0xff: 8}[c]
+        v = int.from_bytes(raw[pos:pos+n], "little"); pos += n; return v
+    base = bytearray()
+    version = raw[0:4]; pos = 4
+    segwit = raw[pos] == 0 and raw[pos+1] == 1
+    if segwit: pos += 2
+    base += version
+    nin_at = pos; nin = cpt(); base += raw[nin_at:pos]
+    for _ in range(nin):
+        start = pos; pos += 36; sl = cpt(); pos += sl; pos += 4
+        base += raw[start:pos]
+    nout_at = pos; nout = cpt(); base += raw[nout_at:pos]
+    for _ in range(nout):
+        start = pos; pos += 8; sl = cpt(); pos += sl
+        base += raw[start:pos]
+    if segwit:
+        for _ in range(nin):
+            items = cpt()
+            for _ in range(items):
+                il = cpt(); pos += il
+    base += raw[pos:pos+4]                     # locktime
+    h = hashlib.sha256(hashlib.sha256(bytes(base)).digest()).digest()
+    weight = len(base) * 3 + len(raw)
+    return {"txid": h[::-1].hex(), "vsize": (weight + 3) // 4, "size": len(raw)}
+
+class ExplorerRPC:
+    """The explorer backend: balance, UTXOs, feerate and broadcast through the
+    public superknet.com JSON API — for wallets (MMM miners) with no node of
+    their own. Same trust story the page states: the explorer only reports
+    chain data and forwards raw transactions; keys and signing stay here."""
+    is_explorer = True
+    def __init__(self, base, hrp=None):
+        self.base = base.rstrip("/")
+        if not self.base.startswith(("http://", "https://")): self.base = "https://" + self.base
+        self._hrp_given = hrp
+        self.conf = {}
+    @property
+    def _hrp(self):
+        if self._hrp_given: return self._hrp_given
+        try:
+            self._hrp_given = str(self._get("/api/stats").get("hrp") or "txa")
+        except WalletError:
+            self._hrp_given = "txa"
+        return self._hrp_given
+    def _get(self, path, timeout=60):
+        req = urllib.request.Request(self.base + path, headers={"User-Agent": "xcoin-wallet-cli"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r, parse_float=Decimal)
+        except urllib.error.HTTPError as e:
+            try: out = json.loads(e.read().decode(), parse_float=Decimal)
+            except Exception: raise WalletError(f"explorer {path}: HTTP {e.code}")
+            raise WalletError(f"explorer {path}: {out.get('error', 'failed')}")
+        except Exception as e:
+            raise WalletError(f"cannot reach the explorer at {self.base}: {e}")
+    def call(self, method, params=None, timeout=60):
+        params = params or []
+        if method == "getblockchaininfo":
+            return {"chain": f"via explorer ({self._hrp})"}
+        if method == "validateaddress":
+            dec = bech32m_decode_address(params[0], hrps=(self._hrp,))
+            if not dec or dec[1] != 3 or len(dec[2]) != 32: return {"isvalid": False}
+            return {"isvalid": True, "witness_version": 3,
+                    "scriptPubKey": (bytes([0x53, 0x20]) + dec[2]).hex()}
+        if method == "scantxoutset":
+            # the caller hands us raw(<spk>); recover the address for the API
+            spk = params[1][0][4:-1]
+            if not (len(spk) == 68 and spk.startswith("5320")):
+                raise WalletError("explorer backend can only scan witness-v3 scripts")
+            data = _convertbits(bytes.fromhex(spk[4:]), 8, 5, True)
+            values = [3] + data
+            chk = _b32_polymod(_b32_hrp_expand(self._hrp) + values + [0]*6) ^ 0x2bc830a3
+            addr = self._hrp + "1" + "".join(_B32[v] for v in values) + "".join(_B32[(chk >> (5*(5-i))) & 31] for i in range(6))
+            out = self._get(f"/api/utxos/{addr}", timeout=timeout)
+            return {"success": True, "height": out.get("height"),
+                    "total_amount": out.get("total_amount"),
+                    "unspents": [{"txid": u["txid"], "vout": u["vout"],
+                                  "scriptPubKey": u["scriptPubKey"], "amount": u["amount"],
+                                  "coinbase": u.get("coinbase", False), "height": u.get("height"),
+                                  "confirmations": u.get("confirmations")} for u in out.get("utxos", [])]}
+        if method == "getmempoolinfo":
+            return {"minrelaytxfee": Decimal("0.00000100")}
+        if method == "estimatesmartfee":
+            out = self._get("/api/feerate")
+            satvb = Decimal(str(out.get("feerate_sat_vb", 1)))
+            return {"feerate": satvb * 1000 / Decimal(100000000)}   # sat/vB -> XCF/kvB
+        if method == "createrawtransaction":
+            ins, outs = params[0], params[1]
+            pairs = []
+            for o in outs:
+                for addr, amt in o.items():
+                    sats = int((money(amt) * Decimal(100000000)).to_integral_value())
+                    pairs.append((address_to_spk(addr, self._hrp), sats))
+            return build_unsigned_tx(ins, pairs)
+        if method == "sendrawtransaction":
+            body = json.dumps({"hex": params[0]}).encode()
+            req = urllib.request.Request(self.base + "/api/broadcast", data=body,
+                                         headers={"Content-Type": "application/json", "User-Agent": "xcoin-wallet-cli"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return json.load(r)["txid"]
+            except urllib.error.HTTPError as e:
+                try: out = json.loads(e.read().decode())
+                except Exception: raise WalletError(f"broadcast failed: HTTP {e.code}")
+                raise WalletError(f"broadcast rejected: {out.get('reason', out.get('error', 'unknown'))}")
+            except WalletError: raise
+            except Exception as e:
+                raise WalletError(f"cannot reach the explorer at {self.base}: {e}")
+        raise WalletError(f"`{method}` needs a node; it is not available via the explorer backend")
+
+def make_backend(args):
+    explorer = getattr(args, "explorer", None) or os.getenv("XCOIN_EXPLORER")
+    if explorer: return ExplorerRPC(explorer, getattr(args, "hrp", None))
+    rpc = RPC(args)
+    if getattr(args, "hrp", None): rpc._hrp = args.hrp
+    return rpc
+
 class RPC:
     def __init__(self, args):
         self.conf = parse_conf(args.config)
@@ -309,18 +505,33 @@ def sign_offline(seed, raw, prev):
     return out
 
 
-def derive_offline(seed, index):
+def backend_hrp(rpc, args=None):
+    """The chain's address HRP: --hrp wins, else the backend's chain answers
+    (main -> xpa, anything else -> txa), else xpa. Cached on the backend."""
+    if args is not None and getattr(args, "hrp", None): return args.hrp
+    if rpc is None: return "xpa"
+    h = getattr(rpc, "_hrp", None)
+    if h: return h
+    try:
+        chain = (rpc.call("getblockchaininfo") or {}).get("chain", "")
+    except WalletError:
+        chain = ""
+    h = "xpa" if chain in ("", "main", "mainnet") else "txa"
+    rpc._hrp = h
+    return h
+
+def derive_offline(seed, index, hrp="xpa"):
     """Derive address `index` with the native keytool — the seed never leaves this
     host or reaches the node. The seed goes to the tool over stdin (never argv).
-    Returns {address, identity, scriptPubKey, ...}: `address` is the witness v2
-    xpa1z… form, `identity` the forum handle xid1… of the same key (bech32m over
-    SHA-256(pubkey) with no witness version: a handle, nothing can be paid to it)."""
+    Returns {address, identity, scriptPubKey, ...}: `address` is the witness v3
+    xpa1r…/txa1r… form, `identity` the forum handle xid1… of the same key (bech32m
+    over SHA-256(pubkey) with no witness version: a handle, nothing can be paid to it)."""
     tool = keytool_path()
     if not tool:
         raise WalletError("offline keytool not found: build the native keytool (`NEX=.. ./build.sh`) "
                           "; there is no alternative: the seed never leaves this host")
     try:
-        proc = subprocess.run([str(tool), "_address", "--index", str(int(index))],
+        proc = subprocess.run([str(tool), "_address", "--index", str(int(index)), "--hrp", hrp],
                               input=(seed + "\n").encode(), capture_output=True, timeout=60)
     except Exception as e:
         raise WalletError(f"offline keytool could not run: {e}")
@@ -336,7 +547,7 @@ def derive_offline(seed, index):
 
 def derive(rpc, seed, index):
     """Address for key `index`, derived OFFLINE: the seed never reaches the node."""
-    return derive_offline(seed, index)
+    return derive_offline(seed, index, backend_hrp(rpc))
 
 def scan(rpc, script):
     result = rpc.call("scantxoutset", ["start", [f"raw({script})"]], timeout=300)
@@ -412,7 +623,7 @@ def select_coins(mature, amount, feerate=None, fixed_fee=None):
     raise WalletError(f"insufficient spendable funds: have {fmt(total)}, need about {fmt(amount + fee)}")
 
 def wallet_scan(args):
-    rpc, seed = RPC(args), require_seed(args); info = derive(rpc, seed, args.index)
+    rpc, seed = make_backend(args), require_seed(args); info = derive(rpc, seed, args.index)
     return rpc, seed, info, scan(rpc, info["scriptPubKey"])
 
 def maturity_note(immature):
@@ -469,7 +680,7 @@ def cmd_new(args):
     seed = os.urandom(32).hex(); write_seed(p, seed, new_passphrase(args))
     data = {"file": str(p)}
     if not args.offline:
-        data["address"] = derive(RPC(args), seed, 0)["address"]
+        data["address"] = derive(make_backend(args), seed, 0)["address"]
     if args.json:
         # The seed is deliberately NOT included in JSON output; read the file
         # or use `seed --json --yes`.
@@ -501,7 +712,7 @@ def cmd_new_card(args, p):
         blob = mmm2_encode(seedbuf.hex(), factor.bytes(), family, pw)
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f: f.write(blob)
-        address = derive(RPC(args), seedbuf.hex(), 0)["address"] if not args.offline else None
+        address = derive(make_backend(args), seedbuf.hex(), 0)["address"] if not args.offline else None
         permanent = not args.resettable
         if permanent:
             cs.make_permanent(record["uid"])   # commit: discard master+write keys — IRREVERSIBLE
@@ -638,7 +849,7 @@ def cmd_receive(args):
     # Address derivation is offline: no node, no RPC credentials needed.
     # `address`/`receive` print the address; `--identity` (or the `identity`
     # subcommand) prints the same key's forum handle xid1… instead.
-    info = derive(None, require_seed(args), args.index)
+    info = derive_offline(require_seed(args), args.index, getattr(args, "hrp", None) or "xpa")
     if args.json:
         emit_json({"address": info["address"], "identity": info["identity"], "index": args.index, "scriptPubKey": info["scriptPubKey"]}); return
     print(info["identity"] if args.identity else info["address"])
@@ -652,8 +863,8 @@ def cmd_signmessage(args):
     its forum identity xid1… by default: `{address}` in the template is replaced
     by the xid1… string and the JSON "address" field carries it (NerdMiner posts
     that field to the forum as 'address'), so one unlock signs a message that
-    names the signer. `--as address` names the witness v2 xpa1z… form instead.
-    Prints one JSON line {"address","identity","witness_v2_address","pubkey",
+    names the signer. `--as address` names the witness v3 payment address instead.
+    Prints one JSON line {"address","identity","witness_address","pubkey",
     "sig","message_hex","index"}; the seed goes to the native keytool over stdin
     and never reaches the node or the network."""
     seed = read_seed(args.file)
@@ -664,14 +875,15 @@ def cmd_signmessage(args):
     template = args.template if args.template is not None else args.message
     if template is None or template == "":
         raise WalletError("signmessage needs --template TEXT (with {address}) or --message TEXT")
-    info = derive_offline(seed, index)
+    hrp = getattr(args, "hrp", None) or "xpa"
+    info = derive_offline(seed, index, hrp)
     signer = info["address"] if args.sign_as == "address" else info["identity"]
     message = template.replace("{address}", signer)
     # Multi-line messages are fine (the forum's challenge is four lines): the
     # message travels to the keytool as one hex line, never as raw text.
     msg_hex = message.encode("utf-8").hex()
     try:
-        proc = subprocess.run([str(tool), "_signmsg", "--index", str(index)],
+        proc = subprocess.run([str(tool), "_signmsg", "--index", str(index), "--hrp", hrp],
                               input=(seed + "\n" + msg_hex + "\n").encode(), capture_output=True, timeout=120)
     except Exception as e:
         raise WalletError(f"offline keytool could not run: {e}")
@@ -685,7 +897,7 @@ def cmd_signmessage(args):
         raise WalletError("keytool address does not match the derived address")
     if out.get("identity") != info["identity"]:
         raise WalletError("keytool identity does not match the derived identity")
-    result = {"address": signer, "identity": info["identity"], "witness_v2_address": info["address"],
+    result = {"address": signer, "identity": info["identity"], "witness_address": info["address"],
               "pubkey": out["pubkey"], "sig": out["sig"], "message_hex": msg_hex, "index": index}
     print(json.dumps(result))
 
@@ -785,31 +997,44 @@ def cmd_send(args):
     # Sign OFFLINE in the native keytool: the seed never reaches the node.
     signed_hex = sign_offline(seed, raw, prev); signer = "offline keytool"
 
-    accept = rpc.call("testmempoolaccept", [[signed_hex]])
-    verdict = accept[0] if accept else {}
-    decoded = rpc.call("decoderawtransaction", [signed_hex])
-    data = {"txid": decoded.get("txid"), "size": len(signed_hex) // 2,
-            "vsize": decoded.get("vsize"), "fee": fee, "change": change, "signer": signer,
-            "inputs": len(selected), "mempool_accept": bool(verdict.get("allowed")),
-            "broadcast": False}
-    if not verdict.get("allowed"):
-        data["reject_reason"] = verdict.get("reject-reason", "unknown")
+    if getattr(rpc, "is_explorer", False):
+        # No local node: txid/vsize computed here; the explorer's broadcast
+        # endpoint runs testmempoolaccept itself before relaying.
+        local = parse_signed_tx(signed_hex)
+        data = {"txid": local["txid"], "size": local["size"], "vsize": local["vsize"],
+                "fee": fee, "change": change, "signer": signer, "inputs": len(selected),
+                "mempool_accept": None, "broadcast": False}
+        if args.dry_run:
+            if args.json: emit_json(data); return
+            print(f"Dry run: signed OK, NOT broadcast.\nTXID: {data['txid']}\nSigned bytes: {data['size']} ({data['vsize']} vbytes)")
+            print("Mempool check: performed by the explorer at broadcast")
+            return
+    else:
+        accept = rpc.call("testmempoolaccept", [[signed_hex]])
+        verdict = accept[0] if accept else {}
+        decoded = rpc.call("decoderawtransaction", [signed_hex])
+        data = {"txid": decoded.get("txid"), "size": len(signed_hex) // 2,
+                "vsize": decoded.get("vsize"), "fee": fee, "change": change, "signer": signer,
+                "inputs": len(selected), "mempool_accept": bool(verdict.get("allowed")),
+                "broadcast": False}
+        if not verdict.get("allowed"):
+            data["reject_reason"] = verdict.get("reject-reason", "unknown")
 
-    if args.dry_run:
-        if args.json: emit_json(data); return
-        print(f"Dry run: signed OK, NOT broadcast.\nTXID: {data['txid']}\nSigned bytes: {data['size']} ({data['vsize']} vbytes)")
-        if data["mempool_accept"]: print("Mempool check: would be accepted")
-        else: print(f"Mempool check: would be REJECTED ({data['reject_reason']})")
-        return
-    if not data["mempool_accept"]:
-        raise WalletError(f"node would reject this transaction ({data['reject_reason']}); nothing was broadcast")
+        if args.dry_run:
+            if args.json: emit_json(data); return
+            print(f"Dry run: signed OK, NOT broadcast.\nTXID: {data['txid']}\nSigned bytes: {data['size']} ({data['vsize']} vbytes)")
+            if data["mempool_accept"]: print("Mempool check: would be accepted")
+            else: print(f"Mempool check: would be REJECTED ({data['reject_reason']})")
+            return
+        if not data["mempool_accept"]:
+            raise WalletError(f"node would reject this transaction ({data['reject_reason']}); nothing was broadcast")
     txid = rpc.call("sendrawtransaction", [signed_hex])
     data.update(txid=txid, broadcast=True)
     if args.json: emit_json(data); return
     print(f"Broadcast successful\nTXID: {txid}")
 
 def cmd_history(args):
-    rpc, seed = RPC(args), require_seed(args)
+    rpc, seed = make_backend(args), require_seed(args)
     info = derive(rpc, seed, args.index); script = info["scriptPubKey"]
     tip = rpc.call("getblockcount")
     events, my_outpoints = [], {}
@@ -852,7 +1077,7 @@ def cmd_history(args):
         print(f"{where}  {when}  {sign}{fmt(e['net'])}  {e['txid']}{note}")
 
 def cmd_info(args):
-    rpc = RPC(args)
+    rpc = make_backend(args)
     chain = rpc.call("getblockchaininfo"); net = rpc.call("getnetworkinfo"); mem = rpc.call("getmempoolinfo")
     data = {"chain": chain.get("chain"), "blocks": chain.get("blocks"), "headers": chain.get("headers"),
             "bestblockhash": chain.get("bestblockhash"), "difficulty": str(chain.get("difficulty")),
@@ -969,6 +1194,8 @@ def parser():
     p.add_argument("--file", default=str(default_wallet())); p.add_argument("--config", default=str(DEFAULT_CONFIG))
     p.add_argument("--rpc-host"); p.add_argument("--rpc-port", type=int); p.add_argument("--rpc-user"); p.add_argument("--rpc-password")
     p.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    p.add_argument("--explorer", metavar="URL", help="use a public explorer (e.g. superknet.com) instead of a local node: balance/UTXOs/fees/broadcast go through its JSON API; keys and signing stay on this Mac (env: XCOIN_EXPLORER)")
+    p.add_argument("--hrp", choices=("xpa", "txa"), help="address HRP: xpa mainnet, txa testnet A (default: asked of the node, or txa via --explorer)")
     p.add_argument("--passphrase-fd", type=int, metavar="N", help="read the wallet passphrase from file descriptor N (a pipe from a parent program); never from the environment")
     sub = p.add_subparsers(dest="command", required=True)
     q = sub.add_parser("new", help="create a new wallet")
@@ -1020,7 +1247,7 @@ def parser():
     q.add_argument("--message", help="literal message (no substitution)")
     q.add_argument("--index", type=int, default=101, help="key index (the forum identity convention is 101)")
     q.add_argument("--as", dest="sign_as", choices=("identity", "address"), default="identity",
-                   help="sign as the forum identity xid1… (default) or as the witness v2 address xpa1z…")
+                   help="sign as the forum identity xid1… (default) or as the witness v3 payment address")
     q.set_defaults(fn=cmd_signmessage)
     q = sub.add_parser("reset", help="move the seed away (never deletes)"); q.add_argument("--backup", required=True); q.add_argument("--yes", action="store_true"); q.set_defaults(fn=cmd_reset)
     return p

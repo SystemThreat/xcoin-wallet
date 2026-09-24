@@ -58,10 +58,14 @@ class TestMoney(unittest.TestCase):
 
 class TestSizes(unittest.TestCase):
     def test_matches_observed_signed_tx(self):
-        # The real testnet dry-run produced a 5,408-byte signed tx for 1-in/2-out.
+        # The real witness-v3 testnet spend of 2026-09-24 (txid 88665c29db54…)
+        # was exactly 5,433 bytes / 1,429 vB for 1-in/1-out; the node agreed.
+        total, vsize = w.estimate_sizes(1, 1)
+        self.assertEqual(total, 5433)
+        self.assertEqual(vsize, 1429)
         total, vsize = w.estimate_sizes(1, 2)
-        self.assertEqual(total, 5408)
-        self.assertEqual(vsize, (137 * 4 + 5271 + 3) // 4)
+        self.assertEqual(total, 5476)
+        self.assertEqual(vsize, (137 * 4 + 5339 + 3) // 4)
     def test_fee_scales_with_inputs(self):
         rate = Decimal("0.0001")
         self.assertGreater(w.fee_for(2, 2, rate), w.fee_for(1, 2, rate))
@@ -480,7 +484,7 @@ class TestSignMessage(unittest.TestCase):
     """`signmessage` signs a one-line message with the key at --index through the
     native keytool (FIPS 204 ML-DSA-65). NerdMiner login depends on the JSON shape:
     address, pubkey, sig, message_hex. The signer is named by its forum identity
-    (xid1…) by default; --as address names the witness v2 xpa1z… form. Runs only
+    (xid1…) by default; --as address names the witness v3 payment address. Runs only
     when the keytool is built."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
@@ -501,8 +505,8 @@ class TestSignMessage(unittest.TestCase):
         self.assertEqual(d["address"], info["identity"])
         self.assertTrue(d["address"].startswith("xid1"))
         self.assertEqual(d["identity"], info["identity"])
-        self.assertEqual(d["witness_v2_address"], info["address"])
-        self.assertTrue(d["witness_v2_address"].startswith("xpa1z"))
+        self.assertEqual(d["witness_address"], info["address"])
+        self.assertTrue(d["witness_address"].startswith("xpa1r"))
         msg = bytes.fromhex(d["message_hex"]).decode()
         self.assertEqual(msg, f"MineDifferent login v1 | id=abc | address={info['identity']} | exp=1")
         self.assertEqual(len(bytes.fromhex(d["pubkey"])), 1952)
@@ -525,7 +529,7 @@ class TestSignMessage(unittest.TestCase):
         self.assertEqual(bytes.fromhex(d["message_hex"]), b"hello")
         info = w.derive_offline(SEED, 3)
         self.assertEqual(d["address"], info["identity"])
-        self.assertEqual(d["witness_v2_address"], info["address"])
+        self.assertEqual(d["witness_address"], info["address"])
     def test_passphrase_fd_after_the_subcommand_is_accepted(self):
         # An older NerdMiner appends --passphrase-fd after 'signmessage'; the wallet lifts it out.
         locked = Path(self.tmp.name) / "locked2.mmm"; locked.write_bytes(w.mmm_encode(SEED, "pw123"))
@@ -545,16 +549,16 @@ class TestSignMessage(unittest.TestCase):
         self.assertEqual(msg.splitlines()[2], "address: " + d["address"])
         self.assertTrue(msg.splitlines()[2].startswith("address: xid1"))
         self.assertEqual(len(msg.splitlines()), 4)
-    def test_as_address_reproduces_the_legacy_form(self):
-        # --as address: {address} and the "address" field are the witness v2 xpa1z… form,
-        # exactly what signmessage produced before identities; identity is still reported.
+    def test_as_address_names_the_payment_form(self):
+        # --as address: {address} and the "address" field are the witness v3
+        # payment address; identity is still reported.
         rc, out = self.run_cli("signmessage", "--template", "MineDifferent login v1 | id=abc | address={address} | exp=1", "--index", "101", "--as", "address")
         self.assertEqual(rc, 0)
         d = json.loads(out.strip().splitlines()[-1])
         info = w.derive_offline(SEED, 101)
         self.assertEqual(d["address"], info["address"])
-        self.assertTrue(d["address"].startswith("xpa1z"))
-        self.assertEqual(d["witness_v2_address"], d["address"])
+        self.assertTrue(d["address"].startswith("xpa1r"))
+        self.assertEqual(d["witness_address"], d["address"])
         self.assertEqual(d["identity"], info["identity"])
         msg = bytes.fromhex(d["message_hex"]).decode()
         self.assertEqual(msg, f"MineDifferent login v1 | id=abc | address={info['address']} | exp=1")
@@ -618,8 +622,10 @@ class TestIdentity(unittest.TestCase):
     it is not decodable as an address. Runs only when the keytool is built."""
     # index 101 of the test seed: the reference vector shared with the keytool and the forum's JS
     XID_101 = "xid1wexam97j7pmgl45w4xy5jnv8j7jydua38uk4f4pcn6rje23783wq5u0gjr"
-    XPA1Z_101 = "xpa1zwexam97j7pmgl45w4xy5jnv8j7jydua38uk4f4pcn6rje23783wq0snj0g"
+    XPA1R_101 = "xpa1rvmwnky8e5nc7zpdndydws88npq400j4a9cxe7nyh35fw9nekpk8snyc8zr"
     PROG_101 = "764ddd97d2f0768fd68ea989494d8797a446f3b13f2d54d4389e872caa3e3c5c"
+    # witness v3 program = single-leaf Merkle root of PUSH32(SHA-256(pk)) OP_CHECKSIG
+    V3PROG_101 = "66dd3b10f9a4f1e105b3691ae81cf3082af7cabd2e0d9f4c978d12e2cf360d8f"
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.wallet = Path(self.tmp.name) / "wallet.seed"; self.wallet.write_text(SEED + "\n")
@@ -646,14 +652,16 @@ class TestIdentity(unittest.TestCase):
         prog = decode_identity(xid)                          # strict: HRP xid, bech32m, 32 bytes, no version
         self.assertEqual(prog, hashlib.sha256(pubkey).digest())
         self.assertEqual(prog.hex(), info["pubkey_sha256"])
-        # the addresses commit to the very same 32 bytes
+        # the address commits to the same key through the v3 leaf: its program
+        # is the single-leaf Merkle root over PUSH32(SHA-256(pubkey)) OP_CHECKSIG
         hrp, ver, addr_prog = decode_witness(info["address"])
-        self.assertEqual((hrp, ver, addr_prog), ("xpa", 2, prog))
-        self.assertEqual(info["scriptPubKey"], "5220" + prog.hex())
+        self.assertEqual((hrp, ver), ("xpa", 3))
+        self.assertEqual(addr_prog.hex(), info["program"])
+        self.assertEqual(info["scriptPubKey"], "5320" + info["program"])
     def test_reference_vector(self):
         info = w.derive_offline(SEED, 101)
         self.assertEqual(info["identity"], self.XID_101)
-        self.assertEqual(info["address"], self.XPA1Z_101)
+        self.assertEqual(info["address"], self.XPA1R_101)
         self.assertEqual(info["pubkey_sha256"], self.PROG_101)
         self.assertEqual(decode_identity(self.XID_101).hex(), self.PROG_101)
     def test_same_key_same_xid_everywhere(self):
@@ -678,21 +686,21 @@ class TestIdentity(unittest.TestCase):
         lines = out.strip().splitlines()
         self.assertEqual(lines[0], self.XID_101)
         self.assertIn("index: 101", lines)
-        self.assertIn("address: " + self.XPA1Z_101, lines)
+        self.assertIn("address: " + self.XPA1R_101, lines)
     def test_addresses_list_both_with_identity(self):
         rc, out = self.run_cli("addresses", "--start", "100", "--count", "2", "--identity")
         self.assertEqual(rc, 0)
         rows = [l.split() for l in out.strip().splitlines()]
         self.assertEqual([r[0] for r in rows], ["100", "101"])
-        self.assertEqual(rows[1][1:], [self.XPA1Z_101, self.XID_101])
+        self.assertEqual(rows[1][1:], [self.XPA1R_101, self.XID_101])
         for r in rows:
-            self.assertTrue(r[1].startswith("xpa1z")); self.assertTrue(r[2].startswith("xid1"))
+            self.assertTrue(r[1].startswith("xpa1r")); self.assertTrue(r[2].startswith("xid1"))
         rc, out = self.run_cli("addresses", "--start", "101", "--count", "1")
-        self.assertEqual(out.split(), ["101", self.XPA1Z_101])       # default output unchanged
+        self.assertEqual(out.split(), ["101", self.XPA1R_101])       # default output unchanged
         rc, out = self.run_cli("--json", "addresses", "--start", "101", "--count", "1", "--identity")
-        self.assertEqual(json.loads(out), [{"index": 101, "address": self.XPA1Z_101, "identity": self.XID_101}])
+        self.assertEqual(json.loads(out), [{"index": 101, "address": self.XPA1R_101, "identity": self.XID_101}])
         rc, out = self.run_cli("--json", "addresses", "--start", "101", "--count", "1")
-        self.assertEqual(json.loads(out), [{"index": 101, "address": self.XPA1Z_101}])
+        self.assertEqual(json.loads(out), [{"index": 101, "address": self.XPA1R_101}])
     def test_identity_is_not_an_address(self):
         # No chain HRP, and read as <version><program> the 52 data chars leave 7 stray
         # bits (BIP-350 forbids that), so an address parser refuses the string outright.
@@ -710,7 +718,7 @@ class TestIdentity(unittest.TestCase):
         real = subprocess.run
         class Old:
             returncode = 0; stderr = b""
-            stdout = json.dumps({"address": self.XPA1Z_101, "scriptPubKey": "5220" + self.PROG_101, "index": 101}).encode()
+            stdout = json.dumps({"address": self.XPA1R_101, "scriptPubKey": "5220" + self.PROG_101, "index": 101}).encode()
         subprocess.run = lambda *a, **k: Old()
         self.addCleanup(setattr, subprocess, "run", real)
         with self.assertRaises(w.WalletError) as cm: w.derive_offline(SEED, 101)

@@ -6,14 +6,17 @@ Every Xcoin address is an **ML-DSA-65** (FIPS 204, quantum-resistant) key. Addre
 look like `xpa1r…` (`txa1r…` on testnet A). There is no non-quantum spend path — coins
 can only be moved with a real ML-DSA-65 signature.
 
-> **What works today.** Identity and forum sign-in (`identity`, `signmessage` —
-> the `xid1…` key at index 101 that minedifferent.com verifies), wallet creation,
-> encryption, backup, and card wallets are fully supported. The **on-chain payment
-> path is in development**: `address`/`send` currently derive legacy witness v2
-> (`xpa1z…`) outputs, and the live chains (testnet A, and mainnet at genesis)
-> accept only witness v3 (`txa1r…`/`xpa1r…`) with its tagged sighash. Until the
-> keytool's v3 path lands, use this wallet for identity and key custody, not for
-> receiving on the current chain.
+> **What works today: everything.** Identity and forum sign-in (`identity`,
+> `signmessage` — the `xid1…` key at index 101 that minedifferent.com verifies),
+> wallet creation, encryption, backup, card wallets — and, since 2026-09-24, the
+> **full witness v3 payment path**: `address` derives the live chains' `xpa1r…`/
+> `txa1r…` form and `send` signs the v3 tagged sighash offline. The keytool
+> replays the node's own golden vectors (`./xcoin-wallet _v3vectors`) and the
+> path is proven on-chain: testnet A accepted and mined its first keytool-signed
+> v3 spends (txids `88665c29…`, `f035c14d…`, `cd5b6f71…`) the day it landed.
+> With `--explorer https://superknet.com` the wallet needs **no node at all**:
+> balances and fees come from the explorer's public API, transactions are built
+> and signed on this Mac, and the explorer relays the one signed transaction.
 
 The wallet is fully **deterministic and self-custody**: one 256-bit seed is your entire
 wallet. The same seed always regenerates the same keys and addresses, so the seed alone
@@ -24,7 +27,7 @@ Two pieces:
 | Piece | File | Role |
 |---|---|---|
 | Native keytool | `xcoin-wallet.cpp` → `./xcoin-wallet` | Offline key/address derivation, built from the node's own PQClean sources |
-| Wallet CLI | `wallet_cli.py` via `./xcoin-wallet-cli` | Full wallet: balance, UTXOs, send, history, backup — talks to your own node's RPC |
+| Wallet CLI | `wallet_cli.py` via `./xcoin-wallet-cli` | Full wallet: balance, UTXOs, send, history, backup — via your own node's RPC, or node-less with `--explorer` |
 | Card module | `card_seed.py` | NTAG 424 DNA hardware-key support (optional; needs `pyscard` + `cryptography`) |
 
 The CLI derives and signs offline in the native keytool, which is built from the
@@ -109,13 +112,13 @@ the handle you post and chat under on MineDifferent, not a place to send coins.
 
 ```bash
 xcoin-wallet identity --index 101              # xid1…
-xcoin-wallet addresses --count 3 --identity    # index  xpa1z…  xid1…
+xcoin-wallet addresses --count 3 --identity    # index  xpa1r…  xid1…
 ```
 
 `signmessage` signs **as the identity** by default: `{address}` in the template and the
 JSON `address` field are the `xid1…` string (NerdMiner posts that field to the forum as
 `address`); `identity` and `witness_v2_address` are always in the JSON. `--as address`
-names the witness v2 `xpa1z…` form instead, for a verifier that still expects it.
+names the witness v3 payment address instead, for a verifier that expects one.
 
 ### The `.mmm` wallet file
 
@@ -163,12 +166,12 @@ ML-DSA-65 witness signatures locally. The seed — and, for card wallets, the ca
 it came from — never reaches `nexd`. The node only broadcasts and validates the
 finished transaction.
 
-The keytool reimplements the consensus signing path for witness v2 (BIP143-style
-sighash + deterministic ML-DSA-65 key derivation), verified **byte-for-byte against the
-node**; the current chain's witness v3 outputs use a tagged sighash the keytool does
-not implement yet (see "What works today" above). For the v2 path: the node's own signature verifies against the keytool's independently-computed
-sighash, and both produce the identical txid (see `tests/`). There is no node-side
-signing path: the seed never leaves this host.
+The keytool reimplements the consensus signing paths **offline, without the
+node**: witness v3 (the live chains' post-quantum script tree — tagged sighash
+per `src/script/xcoin_v3.h`, single ML-DSA leaf, bare SIGHASH_DEFAULT
+signature) and legacy witness v2 (BIP143-style, kept for sweeping private
+chains). `./xcoin-wallet _v3vectors` replays the node's golden test vectors so
+a drifted build fails loudly
 
 For a true air gap: build the unsigned tx online, carry it to an offline machine holding
 the seed/cards, run the keytool there, and carry the signed hex back to broadcast.
@@ -282,7 +285,7 @@ Point any Xcoin miner (e.g. the MMM Mac Metal Miner) at the pool using your addr
 the stratum username. Append `.aName` to name your rig on the leaderboard:
 
 ```
-xpa1z<youraddress>.studio-m3pro
+xpa1r<youraddress>.studio-m3pro
 ```
 
 Pool: `pool.macmetalminer.com:3333`. Mined coinbase outputs mature after 100 blocks —
