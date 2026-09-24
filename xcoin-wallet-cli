@@ -7,4 +7,12 @@ while [ -h "$SELF" ]; do
   SELF="$(readlink "$SELF")"
   case "$SELF" in /*) ;; *) SELF="$D/$SELF";; esac
 done
-exec python3 -B "$(cd "$(dirname "$SELF")" && pwd)/wallet_cli.py" "$@"
+# Resolve a capable interpreter explicitly: an app launched from the Dock gets
+# a bare PATH (/usr/bin first), and the CLT python there lacks pyscard and
+# cryptography (card wallets). Prefer $XCOIN_PYTHON, then Homebrew, then PATH.
+PY=""
+for c in "${XCOIN_PYTHON:-}" /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+  [ -n "$c" ] && [ -x "$c" ] && PY="$c" && break
+done
+[ -n "$PY" ] || PY=python3
+exec "$PY" -B "$(cd "$(dirname "$SELF")" && pwd)/wallet_cli.py" "$@"
