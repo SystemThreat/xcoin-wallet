@@ -2,6 +2,7 @@
 """Unit tests for wallet_cli.py — all offline, RPC is faked, nothing is broadcast."""
 
 import hashlib, hmac, io, json, os, sys, tempfile, types, unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
@@ -496,6 +497,53 @@ class TestMmmFormat(Base):
         with redirect_stdout(buf):
             rc = w.main(["--file", str(target), "--config", "/nonexistent", *argv])
         return rc, buf.getvalue()
+
+class TestWriteSeedAtomic(unittest.TestCase):
+    """write_seed: the KDF runs before disk, the wallet is complete or absent, never replaced."""
+    NO_SCRYPT = AttributeError("module 'hashlib' has no attribute 'scrypt'")
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name); self.target = self.dir / "wallet.mmm"
+    def listing(self): return sorted(p.name for p in self.dir.iterdir())
+    def test_writes_complete_0600_wallet_leaving_no_temp(self):
+        w.write_seed(self.target, SEED, "pw")
+        self.assertEqual(self.listing(), ["wallet.mmm"])
+        st = os.stat(self.target)
+        self.assertEqual((st.st_mode & 0o777, st.st_nlink), (0o600, 1))
+        self.assertEqual(w.mmm_decode(self.target.read_bytes(), "pw"), SEED)
+    def test_encode_failure_creates_nothing_and_retry_works(self):
+        # a Python without hashlib.scrypt, or SIGTERM during the KDF
+        with mock.patch.object(w, "mmm_encode", side_effect=self.NO_SCRYPT):
+            with self.assertRaises(AttributeError): w.write_seed(self.target, SEED)
+        self.assertEqual(self.listing(), [])
+        w.write_seed(self.target, SEED)
+        self.assertEqual(w.read_seed(self.target), SEED)
+    def test_write_failure_leaves_no_file(self):
+        with mock.patch.object(w.os, "fsync", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(OSError): w.write_seed(self.target, SEED)
+        self.assertEqual(self.listing(), [])
+    def test_existing_wallet_is_never_replaced(self):
+        self.target.write_bytes(b"precious"); os.chmod(self.target, 0o600)
+        with self.assertRaises(FileExistsError): w.write_seed(self.target, SEED)
+        self.assertEqual(self.target.read_bytes(), b"precious")
+        self.assertEqual(self.listing(), ["wallet.mmm"])
+    def test_no_hard_links_falls_back_to_exclusive_create(self):
+        with mock.patch.object(w.os, "link", side_effect=OSError(45, "Operation not supported")):
+            w.write_seed(self.target, SEED)
+            self.assertEqual(self.listing(), ["wallet.mmm"])
+            self.assertEqual(os.stat(self.target).st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError): w.write_seed(self.target, "cd" * 32)
+            with mock.patch.object(w.os, "fsync", side_effect=OSError(28, "No space left on device")):
+                with self.assertRaises(OSError): w.write_seed(self.dir / "other.mmm", SEED)
+        self.assertEqual(self.listing(), ["wallet.mmm"])
+        self.assertEqual(w.read_seed(self.target), SEED)
+    def test_cli_new_after_failed_encode_is_retryable(self):
+        argv = ["--file", str(self.target), "--config", "/nonexistent", "new", "--offline"]
+        with mock.patch.object(w, "mmm_encode", side_effect=self.NO_SCRYPT), redirect_stdout(io.StringIO()):
+            with self.assertRaises(AttributeError): w.main(argv)
+        self.assertEqual(self.listing(), [])
+        with redirect_stdout(io.StringIO()): self.assertEqual(w.main(argv), 0)
+        self.assertEqual(self.listing(), ["wallet.mmm"])
 
 class TestConf(unittest.TestCase):
     def test_parse_conf_ignores_sections_and_comments(self):

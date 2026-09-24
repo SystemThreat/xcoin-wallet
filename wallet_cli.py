@@ -434,10 +434,23 @@ def new_passphrase(args):
         print("passphrases do not match, try again", file=sys.stderr)
 
 def write_seed(path, seed, passphrase=None):
-    """New wallets are written in .mmm format; plaintext is legacy/read-only."""
+    """New wallets are written in .mmm format; plaintext is legacy/read-only.
+    The KDF runs before anything touches disk, and the wallet appears complete or
+    not at all: link() publishes the temp file and never replaces an existing one."""
     p = Path(path); p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as f: f.write(mmm_encode(seed, passphrase or ""))
+    blob = mmm_encode(seed, passphrase or "")
+    def put(q):
+        fd = os.open(q, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as f: f.write(blob); f.flush(); os.fsync(f.fileno())
+        except BaseException:
+            q.unlink(missing_ok=True); raise
+    tmp = p.with_name(f".{p.name}.{os.urandom(6).hex()}.tmp"); put(tmp)
+    try: os.link(tmp, p); return
+    except FileExistsError: raise
+    except OSError: pass   # no hard links here (exFAT, some shares): exclusive create instead
+    finally: tmp.unlink(missing_ok=True)
+    put(p)
 
 def parse_conf(path):
     out = {}
