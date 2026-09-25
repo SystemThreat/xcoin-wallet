@@ -9,8 +9,9 @@ cd "$(dirname "$0")"
 # from; provenance in pqcrypto/*/PQCLEAN). A node source tree, when you have one,
 # takes precedence so wallet and node can never drift: NEX=/path/to/xCoin/source ./build.sh
 PQ="./pqcrypto"
-if [ -n "${NEX:-}" ] && [ -d "$NEX/src/pqcrypto" ]; then PQ="$NEX/src/pqcrypto"
-elif [ ! -d "$PQ/ml-dsa-65" ] && [ -d "$HOME/x-Coin/post-quantum/src/pqcrypto" ]; then PQ="$HOME/x-Coin/post-quantum/src/pqcrypto"
+if [ -n "${NEX:-}" ]; then
+  [ -d "$NEX/src/pqcrypto" ] || { echo "NEX=$NEX has no src/pqcrypto; unset NEX to use the vendored ./pqcrypto"; exit 1; }
+  PQ="$NEX/src/pqcrypto"
 fi
 [ -d "$PQ/ml-dsa-65" ] || { echo "missing $PQ/ml-dsa-65 — vendored sources gone, and no NEX=/path/to/node-tree given"; exit 1; }
 [ -d "$PQ/slh-dsa-sha2-128s" ] && [ -f "$PQ/common/sha2.c" ] || { echo "missing $PQ/slh-dsa-sha2-128s or $PQ/common/sha2.c — this tree predates SLH-DSA (node stage B3); use the vendored ./pqcrypto"; exit 1; }
