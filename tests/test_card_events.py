@@ -35,8 +35,10 @@ class FakeCards:
     def family_of(self, factor): return hashlib.sha256(factor).digest()[:8].hex()
     def auth_path(self, uid): return self.auth_dir / f"card-{uid}.auth"
     def make_permanent(self, uid): pass
-    def provision_card(self, transport, factor, family, label=""):
-        transport.wait_for_card(); self.factor = factor.bytes(); return {"uid": "04a1b2c3d4e5f6"}
+    def provision_card(self, transport, factor, family, label="", exclude=(), before_write=None):
+        transport.wait_for_card()
+        if before_write: before_write()                                      # the card passed its checks: the write begins
+        self.factor = factor.bytes(); return {"uid": "04a1b2c3d4e5f6"}
     def read_factor(self, transport, store=None):
         transport.wait_for_card(); return self.SecureBuffer(self.factor), {"uid": "04a1b2c3d4e5f6", "label": "primary"}
     def factory_reset_card(self, transport):
@@ -47,7 +49,8 @@ class TestCardFlowEvents(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         for k in ("XCOIN_EVENTS", "XCOIN_WALLET_PASSPHRASE"): self.addCleanup(os.environ.pop, k, None); os.environ.pop(k, None)
         self.cards = FakeCards(self.tmp.name)
-        for p in (mock.patch.object(w, "_card_module", lambda: self.cards), mock.patch.object(w, "PASSPHRASE_FROM_FD", None)):
+        for p in (mock.patch.object(w, "_card_module", lambda: self.cards), mock.patch.object(w, "PASSPHRASE_FROM_FD", None),
+                  mock.patch.object(w, "BROADCAST_GRACE", 0)):
             p.start(); self.addCleanup(p.stop)
         self.wallet = Path(self.tmp.name) / "card.mmm"
     def run_cli(self, *argv, events=True):
@@ -63,7 +66,8 @@ class TestCardFlowEvents(unittest.TestCase):
         return json.loads(out), steps
     def test_new_card_announces_its_tap(self):
         d, steps = self.create()
-        self.assertEqual(steps, ["card-wait 42", "WAIT", "card-ok"])
+        # the new card's write commits like a backup card's: card-provisioning once the blank card passed its checks
+        self.assertEqual(steps, ["card-wait 42", "WAIT", "card-provisioning", "card-ok"])
         self.assertTrue(w.is_card_wallet(self.wallet)); self.assertEqual(d["card_uid"], "04a1b2c3d4e5f6")
         self.assertEqual((self.cards.opened, self.cards.closed), (1, 1))
     def test_card_backup_announces_both_taps(self):

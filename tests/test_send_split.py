@@ -3,7 +3,7 @@
 broadcast, dry run, and the XCOIN-EVENT progress lines. RPC and signing are faked;
 nothing is broadcast anywhere."""
 
-import hashlib, io, json, os, subprocess, sys, unittest, urllib.error
+import hashlib, io, json, os, subprocess, sys, time, unittest, urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +13,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import wallet_cli as w
 import test_wallet_cli as T
+
+REAL_SLEEP = time.sleep
+def cli_sleeps(record):
+    """A time.sleep stand-in that records the CLI's own pauses only. subprocess.run(timeout=...)
+    (the keytool call) polls with time.sleep while it reaps the child, now and then: those sleeps
+    run for real, unrecorded, or a timeline would flake."""
+    def sleep(sec):
+        if sys._getframe(1).f_globals.get("__name__") != "wallet_cli": return REAL_SLEEP(sec)
+        record(sec)
+    return sleep
 
 RATE = Decimal("0.0001")          # FakeRPC's fallbackfee: the rate every node-path test pays
 FLOOR = w.DUST_CHANGE
@@ -236,7 +246,9 @@ class TestSplitSendNode(SplitBase):
         pool = coins(240, "14"); self.fake(pool, reject_at=2)
         rc, out, err, ev = self.send("--json", "send", T.DEST, "3333", "--split", "--yes")
         self.assertEqual(rc, 1)
-        self.assertIn("node would reject transaction 2 of 4 (min relay fee not met); nothing was broadcast", err)
+        self.assertIn("error: Nothing was sent: the node refused transaction 2 of 4, so none of the 4 was broadcast: "
+                      "its fee is below the network's minimum relay fee. Send again with a higher fee. (min relay fee not met)", err)
+        self.assertEqual(ev, [f"signing {i} 4" for i in range(1, 5)] + ["rejected 2 4 min-relay-fee-not-met"])
         self.assertEqual(self.called("sendrawtransaction"), [])
         self.fake(coins(240, "14"), reject_at=2)
         rc, out, err, ev = self.send("--json", "send", T.DEST, "3333", "--split", "--yes", "--dry-run")
@@ -300,7 +312,8 @@ class TestSendEvents(SplitBase):
     def test_failed_send_never_says_done(self):
         pool = coins(1, "50"); self.fake(pool, reject_at=1)
         rc, out, err, ev = self.send("--json", "send", T.DEST, "1", "--yes")
-        self.assertEqual((rc, ev), (1, ["signing 1 1"]))                   # rejected before any broadcast: no broadcast-begin
+        # the node's own check refused it before any broadcast: no broadcast-begin, and never done
+        self.assertEqual((rc, ev), (1, ["signing 1 1", "rejected 1 1 min-relay-fee-not-met"]))
     def test_broadcast_begin_just_before_the_first_send(self):
         """One timeline of stderr lines, RPC calls and the grace sleep: broadcast-begin comes
         after every signature and policy check, then the pause, then the first send."""
@@ -315,7 +328,7 @@ class TestSendEvents(SplitBase):
             return real_call(rpc, method, params, timeout)
         os.environ["XCOIN_EVENTS"] = "1"
         with mock.patch.object(T.FakeRPC, "call", call), mock.patch.object(w, "BROADCAST_GRACE", 0.25), \
-             mock.patch.object(w.time, "sleep", lambda s: line.append(("sleep", s))), redirect_stdout(io.StringIO()), redirect_stderr(Tee()):
+             mock.patch.object(w.time, "sleep", cli_sleeps(lambda s: line.append(("sleep", s)))), redirect_stdout(io.StringIO()), redirect_stderr(Tee()):
             rc = w.main(["--file", str(self.wallet), "--config", "/nonexistent", "--json", "send", T.DEST, "3333", "--split", "--yes"])
         self.assertEqual(rc, 0)
         at = line.index(("stderr", "XCOIN-EVENT broadcast-begin 4"))
@@ -326,7 +339,7 @@ class TestSendEvents(SplitBase):
         self.assertEqual(sum(1 for k in line if k[1] == "XCOIN-EVENT broadcast-begin 4"), 1)
     def test_no_broadcast_begin_or_pause_without_events_or_broadcast(self):
         slept = []
-        with mock.patch.object(w.time, "sleep", slept.append):
+        with mock.patch.object(w.time, "sleep", cli_sleeps(slept.append)):
             pool = coins(240, "14"); self.fake(pool)
             rc, out, err, ev = self.send("--json", "send", T.DEST, "3333", "--split", "--yes", events=False)
             self.assertEqual((rc, slept), (0, []))                          # plain CLI use never pauses
@@ -338,25 +351,34 @@ class TestSendEvents(SplitBase):
 
 class TestParentGone(SplitBase):
     """MMM quit or died mid-broadcast: the pipes it read are closed. The orphaned CLI (a real
-    child process on real pipes; RPC and signing faked) still attempts every planned broadcast."""
+    child process on real pipes; RPC and signing faked) still attempts every planned broadcast.
+    `gate` is the step at which the child waits until the parent has closed both pipes, so the
+    parent's close lands at a known point and never races the child's next writes: "send" (each
+    broadcast) or "sign" (each signing, after its `signing <i> <n>` line is out)."""
     CHILD = """
 import os, signal, sys, time
-closed, tried, sigpipe = sys.argv[1:4]; sys.path[:0] = sys.argv[4:6]
+closed, tried, sigpipe, gate = sys.argv[1:5]; sys.path[:0] = sys.argv[5:7]
 if sigpipe == "default": signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # as if not Python's own SIG_IGN
 import wallet_cli as w, test_send_split as S
 b = S.SplitBase(); b.setUp(); b.fake(S.coins(240, "14")); os.environ["XCOIN_EVENTS"] = "1"
-send = S.T.FakeRPC.responses["sendrawtransaction"]
-def attempt(p):
+def closed_by_parent():
     while not os.path.exists(closed): time.sleep(0.01)                  # the parent has closed both pipes
+send, sign = S.T.FakeRPC.responses["sendrawtransaction"], w.sign_offline
+def attempt(p):
+    if gate == "send": closed_by_parent()
     with open(tried, "a") as f: f.write(b.txid(p[0]) + "\\n")
     return send(p)
+def signing(seed, raw, prev):
+    if gate == "sign": closed_by_parent()
+    return sign(seed, raw, prev)
 S.T.FakeRPC.responses["sendrawtransaction"] = attempt
-sys.exit(w.main(["--file", str(b.wallet), "--config", "/nonexistent", *sys.argv[6:]]))
+w.sign_offline = signing
+sys.exit(w.main(["--file", str(b.wallet), "--config", "/nonexistent", *sys.argv[7:]]))
 """
-    def run_orphan(self, *argv, sigpipe="python", close_after=b"XCOIN-EVENT broadcast-begin 4"):
+    def run_orphan(self, *argv, sigpipe="python", close_after=b"XCOIN-EVENT broadcast-begin 4", gate="send"):
         closed, tried = Path(self.tmp.name) / "closed", Path(self.tmp.name) / "tried"
         here = Path(__file__).resolve().parent
-        p = subprocess.Popen([sys.executable, "-c", self.CHILD, str(closed), str(tried), sigpipe, str(here.parent), str(here), *argv],
+        p = subprocess.Popen([sys.executable, "-c", self.CHILD, str(closed), str(tried), sigpipe, gate, str(here.parent), str(here), *argv],
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         for line in p.stderr:
             if line.startswith(close_after): break
@@ -376,14 +398,17 @@ sys.exit(w.main(["--file", str(b.wallet), "--config", "/nonexistent", *sys.argv[
 
     def test_nothing_is_sent_when_the_parent_dies_before_broadcast_begin(self):
         # MMM never learned the send was committed, so it could not warn the user at the next
-        # launch: the orphan must stop instead of broadcasting behind its back.
+        # launch: the orphan must stop instead of broadcasting behind its back. The child holds its
+        # first signing until the pipes are closed: were it free to run on, it could put every
+        # later line, broadcast-begin included, into the pipe before the parent's close, and then
+        # the send would rightly be committed (the flake this gate removes).
         pool = coins(240, "14"); self.fake(pool)
         for argv in (("--json",), ()):
             for sigpipe in ("python", "default"):
                 with self.subTest(argv=argv, sigpipe=sigpipe):
                     for f in ("closed", "tried"): (Path(self.tmp.name) / f).unlink(missing_ok=True)
                     rc, tried = self.run_orphan(*argv, "send", T.DEST, "3333", "--split", "--yes",
-                                                sigpipe=sigpipe, close_after=b"XCOIN-EVENT signing 1 4")
+                                                sigpipe=sigpipe, close_after=b"XCOIN-EVENT signing 1 4", gate="sign")
                     self.assertEqual(tried, [])
                     self.assertNotEqual(rc, 0)
 

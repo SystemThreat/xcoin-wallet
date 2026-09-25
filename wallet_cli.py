@@ -12,7 +12,7 @@ fallback leaf 0xc2}; the single-leaf tree {ML-DSA-65 leaf} of the same key (the
 counted and spent. Derivation and signing live in the native keytool.
 """
 
-import argparse, base64, contextlib, getpass, hashlib, hmac, json, os, shutil, signal, subprocess, sys, time, urllib.request, urllib.error
+import argparse, base64, contextlib, getpass, hashlib, hmac, importlib, json, os, re, shutil, signal, subprocess, sys, time, urllib.request, urllib.error
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 
@@ -48,6 +48,20 @@ MAX_STANDARD_TX_WEIGHT = 400_000  # node policy.h: heavier transactions are neve
 
 class WalletError(RuntimeError): pass
 
+class BroadcastRejected(WalletError):
+    """The explorer or the node ANSWERED that it refuses the transaction: it was not accepted
+    and not relayed, unless `already_out` (the network already has it: it IS out)."""
+    ALREADY = ("txn-already-in-mempool", "txn-already-known", "transaction already in block chain",
+               "transaction outputs already in utxo set", "txn-same-nonwitness-data-in-mempool")
+    def __init__(self, reason, already=False):
+        self.reason = " ".join(str(reason).split()) or "rejected"
+        self.already_out = already or self.is_already(self.reason)
+        super().__init__(f"broadcast rejected: {self.reason}")
+    @classmethod
+    def is_already(cls, reason):
+        """The network already has this transaction (in its mempool or a block): it IS out."""
+        return any(k in str(reason).lower() for k in cls.ALREADY)
+
 def money(v, what="amount"):
     try: return Decimal(str(v)).quantize(Decimal("0.00000001"))
     except InvalidOperation: raise WalletError(f"invalid {what}: {v!r}")
@@ -81,7 +95,7 @@ def event(*parts):
     """`XCOIN-EVENT <parts>` progress line on stderr for a parent program (MMM); only under XCOIN_EVENTS=1."""
     if os.getenv("XCOIN_EVENTS") == "1": say("XCOIN-EVENT " + " ".join(map(str, parts)), sys.stderr)
 
-BROADCAST_GRACE = 0.5   # seconds between broadcast-begin and the first send (events on only)
+BROADCAST_GRACE = 0.5   # seconds between broadcast-begin (or card-provisioning) and the first send (or card write); events on only
 
 def broadcast_begin(n):
     """Just before the first send. From here only a broadcast's own failure stops the loop:
@@ -94,6 +108,176 @@ def broadcast_begin(n):
     COMMITTED = True
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     if os.getenv("XCOIN_EVENTS") == "1": time.sleep(BROADCAST_GRACE)
+
+_SIGTERM_SET_ASIDE = []   # the SIGTERM handler a card write set aside; provisioning_end() restores it
+
+def provisioning_begin():
+    """card-backup --auto-swap and new --card, just before the first write to the blank card: the
+    commit point, like broadcast_begin. XCOIN-EVENT card-provisioning is a strict write (a parent
+    already gone means nobody sees the card being written, so nothing is written); then the pause,
+    in which a cancel already on its way still stops the run with the card untouched; from the
+    first write on, SIGTERM and SIGPIPE cannot stop it half way (a half-written card is worse than
+    none) until provisioning_end(), once the write and its key-file update are done (for new
+    --card, also the wallet file)."""
+    global COMMITTED
+    events = os.getenv("XCOIN_EVENTS") == "1"
+    if events: event("card-provisioning")
+    COMMITTED = True
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    if events: time.sleep(BROADCAST_GRACE)
+    _SIGTERM_SET_ASIDE.append(signal.signal(signal.SIGTERM, signal.SIG_IGN))
+
+def provisioning_end():
+    """SIGTERM stops the CLI again (SIGPIPE stays ignored: output to a gone parent is dropped)."""
+    while _SIGTERM_SET_ASIDE: signal.signal(signal.SIGTERM, _SIGTERM_SET_ASIDE.pop())
+
+# --- card and reader faults ------------------------------------------------
+READER_HINT = "If this keeps happening, unplug the card reader, plug it back in, and try again."
+CARD_RESET_HRESULTS = (0x80100068, 0x80100069)   # SCARD_W_RESET_CARD, SCARD_W_REMOVED_CARD
+CARD_READ_RETRIES = 2                            # a read the reader reset is tried again at most this often
+
+def pyscard_error(e):
+    """True for an exception of pyscard / PC-SC: any class under the smartcard package, or the
+    `error` of its low-level C extension smartcard.scard, whose module calls itself plain `scard`."""
+    return any((getattr(c, "__module__", None) or "").split(".")[0] in ("smartcard", "scard", "_scard") for c in type(e).__mro__)
+
+def mark_card_fault(e):
+    """Mark a fault of a card exchange `card_fault` when it is not a CardError, a pyscard fault or a
+    WalletError (which name themselves): an OSError or TimeoutError out of the reader's driver, a
+    ValueError from an answer that makes no sense. A closed pipe to the parent is our own output
+    failing, not the card, and a KeyboardInterrupt is the user: both stay unmarked."""
+    cs = sys.modules.get("card_seed")
+    if (isinstance(e, Exception) and not isinstance(e, (WalletError, BrokenPipeError, getattr(cs, "CardError", ())))
+            and not pyscard_error(e)):
+        with contextlib.suppress(AttributeError, TypeError): e.card_fault = True
+
+@contextlib.contextmanager
+def card_io():
+    """Around card and reader exchanges (the reads, the blank-card check, the waits): a fault is
+    marked by mark_card_fault, so main() prints one plain `error:` line for it instead of a
+    traceback. A write already turns every fault into card_seed.CardWriteError, which passes as it
+    is; card_error_line marks its cause the same way."""
+    try: yield
+    except Exception as e:
+        mark_card_fault(e)
+        raise
+
+def card_was_reset(e):
+    """The reader reset the card, or lost it, in the middle of an exchange."""
+    hr = getattr(e, "hresult", None)
+    if isinstance(hr, int) and hr != -1 and (hr & 0xFFFFFFFF) in CARD_RESET_HRESULTS: return True
+    return pyscard_error(e) and any(c.__name__ == "CardConnectionException" for c in type(e).__mro__)
+
+def read_card(cs, transport, store=None):
+    """cs.read_factor, read again when the reader reset the card (or lost it) mid-read: XCOIN-EVENT
+    card-retry <attempt>, reconnect, read, at most CARD_READ_RETRIES times. Reads only: a write is
+    never retried."""
+    attempt = 0
+    while True:
+        try: return cs.read_factor(transport, store)
+        except Exception as e:
+            if attempt >= CARD_READ_RETRIES or not card_was_reset(e):
+                if attempt: e.card_attempts = attempt + 1
+                raise
+        attempt += 1
+        event("card-retry", attempt)
+        print(f"The reader reset the card. Keep it on the reader: reading it again ({attempt} of {CARD_READ_RETRIES})...", file=sys.stderr)
+        transport.close()   # the next read connects afresh
+
+PCSC_PLAIN = {0x8010001D: "the Mac's smart card service did not answer", 0x8010001E: "the Mac's smart card service did not answer",
+              0x8010002E: "no card reader was found", 0x80100009: "the card reader is not available",
+              0x80100017: "the card reader is not available", 0x8010000C: "no card was on the reader",
+              0x80100066: "the card did not answer the reader", 0x80100067: "the card did not answer the reader",
+              0x8010000A: "the card reader did not answer in time"}   # PC/SC result codes, in plain words
+
+def _card_fault_text(e):
+    """(plain words, reader-level?) for one card or reader fault."""
+    if isinstance(e, KeyboardInterrupt): return "it was interrupted", False
+    detail = " ".join(str(e).split())
+    if not pyscard_error(e):
+        cs = sys.modules.get("card_seed")
+        if getattr(e, "card_fault", False) and not isinstance(e, getattr(cs, "CardError", ())):
+            what = ("the card reader did not answer in time" if isinstance(e, TimeoutError) else
+                    "the card reader reported an error" if isinstance(e, OSError) else
+                    "the card or the reader gave an answer that could not be used")
+            return f"{what} ({detail or type(e).__name__})", True
+        return detail or type(e).__name__, isinstance(e, getattr(cs, "ReaderError", ()))
+    names = {c.__name__ for c in type(e).__mro__}
+    hr = getattr(e, "hresult", -1)
+    hr = hr & 0xFFFFFFFF if isinstance(hr, int) and hr != -1 else None
+    what = ("the reader reset the card or lost contact with it" if hr in CARD_RESET_HRESULTS else
+            PCSC_PLAIN[hr] if hr in PCSC_PLAIN else
+            "the reader reset the card or lost contact with it" if card_was_reset(e) else
+            "no card was on the reader" if "NoCardException" in names else
+            "no card reader was found" if names & {"NoReadersException", "InvalidReaderException", "ListReadersException"} else
+            "no card was presented in time" if "CardRequestTimeoutException" in names else
+            "the Mac's smart card service did not answer" if names & {"EstablishContextException", "ReleaseContextException",
+                                                                      "CardServiceStoppedException", "CardServiceNotFoundException"} else
+            "the card reader reported an error")
+    tries = getattr(e, "card_attempts", None)
+    if tries: what += f", {tries} times"
+    return what + (f" ({detail})" if detail else ""), True
+
+CARD_OUTCOME = {"send": "nothing was sent", "new": "nothing was written to the card and no wallet was created",
+                "card-provision": "nothing was written to the card and no wallet was created",
+                "card-backup": "nothing was written", "card-reset": "nothing was changed on the card",
+                "signmessage": "nothing was signed"}
+CARD_WRITE_FAILED = {
+    "card-backup": "writing the backup card did not finish ({}). Do not rely on that card: make another backup with a fresh blank card.",
+    "new": "setting up the new card did not finish ({}), so no wallet was created. Do not rely on that card.",
+    "card-provision": "setting up the new card did not finish ({}), so no wallet was created. Do not rely on that card.",
+    "card-reset": "resetting the card did not finish ({}). Its key file was kept: put the card back on the reader and run card-reset again."}
+
+def card_error_line(e, command=None):
+    """The one `error:` line for a card or reader fault (a CardError of card_seed, any pyscard /
+    PC-SC exception, or another fault card_io() caught in a card exchange): what went wrong, what
+    was or was not done, and for reader-level faults how to clear them. None for anything else."""
+    cs = sys.modules.get("card_seed")
+    if isinstance(e, getattr(cs, "CardWriteError", ())):
+        cause = e.cause if e.cause is not None else e
+        # card_seed names every fault of a write's key-file steps itself (a CardError), so any other
+        # cause came out of the card exchange: the reader's driver or an answer that makes no sense
+        if cause is not e: mark_card_fault(cause)
+        what, reader = _card_fault_text(cause)
+        line = CARD_WRITE_FAILED.get(command, "the write to the card did not finish ({}). Do not rely on that card.").format(what)
+    elif isinstance(e, getattr(cs, "CardError", ())) or pyscard_error(e) or getattr(e, "card_fault", False):
+        what, reader = _card_fault_text(e)
+        if not isinstance(e, getattr(cs, "CardError", ())): what = "the card could not be read: " + what
+        line = what if re.search(r"\bnothing (was|is)\b", what) else f"{what}; {CARD_OUTCOME.get(command, 'nothing was changed')}."
+    else:
+        return None
+    if reader: line += " " + READER_HINT
+    return " ".join(line.split())
+
+# --- broadcast rejections --------------------------------------------------
+def reject_plain(reason):
+    """A network reject reason in plain words (the caller appends the raw one)."""
+    r = reason.lower()
+    # coins already in an unconfirmed send: this node answers "insufficient fee" (rbf fee rules),
+    # "replacement-failed" (the feerate-diagram rule) or "too many potential replacements";
+    # txn-mempool-conflict is older nodes' word for the same
+    if any(k in r for k in ("txn-mempool-conflict", "insufficient fee", "replacement-failed", "bip125-replacement-disallowed",
+                            "too many potential replacements", "replacement-adds-unconfirmed")):
+        return "these coins are already being spent by an earlier send that has not confirmed yet. Wait for the next block, then send again."
+    # testmempoolaccept (the explorer's check) says missing-inputs; sendrawtransaction bad-txns-inputs-missingorspent
+    if "missingorspent" in r or "missing-inputs" in r or "inputs missing or spent" in r:
+        return "these coins were already spent."
+    if "mempool min fee not met" in r:
+        return "its fee is below what the network accepts right now. Send again with a higher fee."
+    if "min relay fee not met" in r:
+        return "its fee is below the network's minimum relay fee. Send again with a higher fee."
+    if "below-min" in r or r.startswith("dust"):
+        return f"an amount in it is below the network's smallest allowed output ({fmt(DUST_CHANGE)}, 10,000 sat)."
+    if "bad_hex" in r or "decode failed" in r:
+        return "the transaction could not be read."
+    if "too_large" in r or "tx-size" in r:
+        return "the transaction is too large."
+    return "the network refused this transaction."
+
+def reject_token(reason):
+    """A reject reason as one event token: its head (before , ; : ( .), lower case, dashed."""
+    head = re.split(r"[,;:(.]", reason.strip(), maxsplit=1)[0].lower()
+    return re.sub(r"[^a-z0-9_-]+", "-", head).strip("-")[:64] or "rejected"
 
 # --- .mmm wallet file format ---------------------------------------------
 # magic(10) | salt(16) | nonce(16) | ciphertext(32-64) | hmac-sha256(32)
@@ -367,18 +551,19 @@ def card_passphrase(required=False):
 @contextlib.contextmanager
 def card_reader(cs):
     """A transport for ONE NFC wait, announced as XCOIN-EVENT card-wait <budget>;
-    every card flow opens its waits here (the caller emits card-ok on success)."""
-    transport = cs.PCSCTransport()
+    every card flow opens its waits here (the caller emits card-ok on success). A fault of the reader
+    or the card in the body is one plain error line (card_io); the card-wait event is not."""
+    with card_io(): transport = cs.PCSCTransport()
     try:
         event("card-wait", cs.card_timeout())
-        yield transport
+        with card_io(): yield transport
     finally:
         transport.close()
 
 def tap_factor(cs, store=None):
     """The one card wait of an unlock."""
     with card_reader(cs) as transport:
-        return cs.read_factor(transport, store)
+        return read_card(cs, transport, store)
 
 def read_seed_card(blob):
     """Unlock a card-bound wallet: tap the matching card, read its factor over
@@ -695,9 +880,16 @@ class ExplorerRPC:
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     return json.load(r)["txid"]
             except urllib.error.HTTPError as e:
+                # The explorer's own answer (xcoin-explorer.py api_broadcast): 400 {"error": "rejected",
+                # "reason": ...} when testmempoolaccept or sendrawtransaction refused it, 400 bad_hex /
+                # 413 too_large before the node is asked. Anything else (503 node_unreachable, 500, a
+                # proxy's page) says nothing certain about whether it went out.
                 try: out = json.loads(e.read().decode())
-                except Exception: raise WalletError(f"broadcast failed: HTTP {e.code}")
-                raise WalletError(f"broadcast rejected: {out.get('reason', out.get('error', 'unknown')) if isinstance(out, dict) else out}")
+                except Exception: out = None
+                if isinstance(out, dict) and 400 <= e.code < 500 and (out.get("reason") or out.get("error") in ("rejected", "bad_hex", "too_large")):
+                    raise BroadcastRejected(out.get("reason") or out["error"])
+                detail = "; ".join(str(out[k]) for k in ("error", "note") if out.get(k)) if isinstance(out, dict) else ""
+                raise WalletError(f"broadcast failed: the explorer answered HTTP {e.code}" + (f" ({detail})" if detail else ""))
             except WalletError: raise
             except Exception as e:
                 raise WalletError(f"cannot reach the explorer at {self.base}: {e}")
@@ -736,8 +928,14 @@ class RPC:
             except Exception: raise WalletError(f"RPC {method} failed: HTTP {e.code}")
         except Exception as e:
             raise WalletError(f"cannot reach nexd RPC at {self.host}:{self.port}: {e}")
-        if result.get("error"):
-            raise WalletError(f"RPC {method}: {result['error'].get('message', result['error'])}")
+        err = result.get("error")
+        if err:
+            msg = err.get("message", err) if isinstance(err, dict) else err
+            # sendrawtransaction refused (-26 rejected, -25 verify/missing inputs, -22 undecodable)
+            # or already confirmed (-27): the node's answer, so certain
+            if method == "sendrawtransaction" and isinstance(err, dict) and err.get("code") in (-22, -25, -26, -27):
+                raise BroadcastRejected(msg, already=err.get("code") == -27)
+            raise WalletError(f"RPC {method}: {msg}")
         return result.get("result")
 
 def keytool_path():
@@ -1032,23 +1230,29 @@ def cmd_new_card(args, p):
     cs = _card_module(); cs.disable_core_dumps()
     if not args.offline and args.json:
         raise WalletError("card wallet creation is interactive; use --offline for JSON")
+    # optional second factor, asked before the card is touched: nothing waits on the keyboard once the write began
+    pw = new_passphrase(args)
     factor = cs.SecureBuffer(os.urandom(cs.FACTOR_LEN))
     seedbuf = cs.SecureBuffer(os.urandom(32))
     try:
         family = cs.family_of(factor.bytes())
         print("Provisioning the PRIMARY card — tap and hold it on the reader.", file=sys.stderr)
-        with card_reader(cs) as transport:
-            record = cs.provision_card(transport, factor, family, label=args.label or "primary")
-        event("card-ok")
-        auth_file = cs.auth_path(record["uid"])   # provision_card already saved it (crash-safe)
-        pw = new_passphrase(args)   # optional second factor
-        blob = mmm2_encode(seedbuf.hex(), factor.bytes(), family, pw)
-        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as f: f.write(blob)
-        address = derive(make_backend(args), seedbuf.hex(), 0)["address"] if not args.offline else None
         permanent = not args.resettable
-        if permanent:
-            cs.make_permanent(record["uid"])   # commit: discard master+write keys — IRREVERSIBLE
+        try:
+            with card_reader(cs) as transport:
+                # card-provisioning is the commit point, as for a backup card: see provisioning_begin
+                record = cs.provision_card(transport, factor, family, label=args.label or "primary",
+                                           before_write=provisioning_begin)
+            event("card-ok")
+            auth_file = cs.auth_path(record["uid"])   # provision_card already saved it (crash-safe)
+            blob = mmm2_encode(seedbuf.hex(), factor.bytes(), family, pw)
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f: f.write(blob)
+            if permanent:
+                cs.make_permanent(record["uid"])   # commit: discard master+write keys — IRREVERSIBLE
+        finally:
+            provisioning_end()   # the card, its key file and the wallet file are done (or it failed): SIGTERM stops it again
+        address = derive(make_backend(args), seedbuf.hex(), 0)["address"] if not args.offline else None
         data = {"file": str(p), "card_uid": record["uid"], "family": family,
                 "auth_file": str(auth_file), "passphrase_protected": bool(pw),
                 "permanent": permanent}
@@ -1067,9 +1271,22 @@ def cmd_new_card(args, p):
     print("\nIMPORTANT: with no printed seed, this card is your ONLY backup.")
     print("Make a DUPLICATE backup card now:  xcoin-wallet card-backup --file " + str(p))
 
+def family_cards(family, auth_dir):
+    """Public fields of the provisioned cards of `family` in the auth store (never a key).
+    A record left half-way (fault before its keys were rotated) does not count."""
+    rows = []
+    for f in sorted(Path(auth_dir).glob("card-*.auth")):
+        try: rec = json.loads(f.read_text())
+        except (OSError, ValueError): continue
+        if not isinstance(rec, dict) or rec.get("family") != family or rec.get("state", "provisioned") != "provisioned": continue
+        rows.append({"uid": rec.get("uid"), "label": rec.get("label"), "permanent": bool(rec.get("permanent")),
+                     "created": rec.get("created")})
+    return rows
+
 def cmd_card_backup(args):
     """Make a DUPLICATE backup card carrying the same factor as this wallet.
-    Tap the existing card (to read the factor), then tap a factory card."""
+    Tap the existing card (to read the factor), then tap a factory card.
+    --auto-swap: the reader sees the swap (card-swap, card-removed); no Enter key."""
     cs = _card_module(); cs.disable_core_dumps()
     p = Path(args.file)
     if not is_card_wallet(p): raise WalletError(f"{p} is not a card-bound wallet")
@@ -1078,34 +1295,104 @@ def cmd_card_backup(args):
     want_family = mmm2_family(p.read_bytes())
     print("Step 1/2 — tap an EXISTING card for this wallet (to copy its key).", file=sys.stderr)
     with card_reader(cs) as t1:
-        factor, _auth = cs.read_factor(t1)
+        factor, primary = read_card(cs, t1)
     try:
         if cs.family_of(factor.bytes()) != want_family:
             raise WalletError("that card does not belong to this wallet")
         event("card-ok")
-        input("Step 2/2 — remove it, place a FACTORY card, then press Enter... ")
-        with card_reader(cs) as t2:
-            record = cs.provision_card(t2, factor, want_family, label=args.label or "backup")
+        if args.auto_swap:
+            event("card-swap")
+            print("Step 2/2 — take the wallet card off the reader, then place a NEW blank card on it.", file=sys.stderr)
+            with card_io(), contextlib.closing(cs.PCSCTransport()) as t: t.wait_for_removal()
+            event("card-removed")
+            # no key press confirms the swap, so the card just read must be refused if it comes back
+            # card-provisioning is the commit point: see provisioning_begin
+            extra = {"exclude": {primary["uid"]}, "before_write": provisioning_begin}
+        else:
+            input("Step 2/2 — remove it, place a FACTORY card, then press Enter... ")
+            extra = {}
+        try:
+            with card_reader(cs) as t2:
+                record = cs.provision_card(t2, factor, want_family, label=args.label or "backup", **extra)
+            auth_file = cs.auth_path(record["uid"])
+            permanent = not args.resettable
+            if permanent:
+                cs.make_permanent(record["uid"])
+        finally:
+            provisioning_end()   # the write and its key-file update are done (or failed): SIGTERM stops it again
         event("card-ok")
-        auth_file = cs.auth_path(record["uid"])
-        permanent = not args.resettable
-        if permanent:
-            cs.make_permanent(record["uid"])
     finally:
         factor.close()
-    if args.json: emit_json({"backup_card_uid": record["uid"], "auth_file": str(auth_file),
-                             "family": want_family, "permanent": permanent}); return
-    print(f"\nBackup card ready — UID {record['uid']} (family {want_family}).")
-    print(f"Card keys stored: {auth_file}")
-    if permanent: print("Sealed permanently (master + write keys discarded).")
-    print("Either card now unlocks this wallet. Store them in separate physical locations.")
+    if args.json:
+        emit_json({"ok": True, "card_uid": record["uid"], "family": want_family, "permanent": permanent,
+                   "cards": len(family_cards(want_family, cs.AUTH_DIR))} if args.auto_swap else
+                  {"backup_card_uid": record["uid"], "auth_file": str(auth_file), "family": want_family, "permanent": permanent})
+    else:
+        print(f"\nBackup card ready — UID {record['uid']} (family {want_family}).")
+        print(f"Card keys stored: {auth_file}")
+        if permanent: print("Sealed permanently (master + write keys discarded).")
+        print("Either card now unlocks this wallet. Store them in separate physical locations.")
+    if args.auto_swap: event("done")
+
+def card_modules_missing():
+    """card_seed would not load: the Python modules of the card software that are missing, in words
+    ("the cryptography Python module"), each checked by importing what card_seed and the reader
+    import. None when both import (then card_seed itself is what failed)."""
+    def loads(*names):
+        try:
+            for n in names: importlib.import_module(n)
+        except Exception: return False
+        return True
+    gone = [m for m, ok in (("pyscard", loads("smartcard.System", "smartcard.scard")),
+                            ("cryptography", loads("cryptography.hazmat.primitives.ciphers", "cryptography.hazmat.primitives.cmac")))
+            if not ok]
+    return f"the {' and '.join(gone)} Python module{'s' if len(gone) > 1 else ''}" if gone else None
+
+def cmd_card_status(args):
+    """Which cards back a card wallet up: from the file header and the auth store
+    alone — no card tap, no passphrase."""
+    p = Path(args.file)
+    fmt, card = _wallet_format(p)
+    if fmt is None: raise WalletError(f"no wallet at {p}")
+    data = {"card": card, "format": fmt.removesuffix("-card"), "family": None, "cards": [], "count": None,
+            "backup_supported": False, "note": "not a card-bound wallet"}
+    if fmt == "mmm2":
+        # card_seed loads with cryptography alone; the reader needs pyscard too, which it imports only
+        # when a card is tapped, so ask for it here
+        try:
+            cs = _card_module()
+            auth_dir, missing, broken = cs.AUTH_DIR, None if cs.pcsc_available() else "the pyscard Python module", False
+        except WalletError:   # no card stack here; the store still reads
+            auth_dir, missing = Path.home() / ".xcoin", card_modules_missing()
+            broken = missing is None
+        data["family"] = mmm2_family(_head(p))
+        rows = family_cards(data["family"], auth_dir); n = len(rows)
+        why = []   # a backup card cannot be made on this Mac: say why
+        if n == 0: why.append("No key file for this wallet's cards is on this Mac: its cards were set up on another Mac, "
+                              "so it cannot be unlocked here and a backup card can only be made there.")
+        if missing: why.append(f"The card software this needs ({missing}) is not installed for the Python this "
+                               "wallet runs with, so no backup card can be made on this Mac.")
+        elif broken: why.append("The card software could not be loaded for the Python this wallet runs with, "
+                                "so no backup card can be made on this Mac.")
+        data.update(cards=rows, count=n, backup_supported=not why,
+                    note=" ".join(why) if why else
+                         "one card unlocks this wallet and there is no backup card: make one with card-backup" if n == 1 else
+                         f"{n} cards unlock this wallet")
+    elif card:
+        data["family"] = mmm5_parts(p.read_bytes())[0] if fmt == "mmm5-card" else wallet_header(_head(p))["family"]
+        data["note"] = "This card wallet was made with dex-wallet-cli, so its backup cards are made there too."
+    if args.json: emit_json(data); return
+    print(f"{p}: " + (f"card wallet ({data['format']}), family {data['family']}" if card else f"{data['format']} wallet, no card"))
+    for r in data["cards"]:
+        print(f"  {r['uid']}  {r['label'] or ''}  {'permanent' if r['permanent'] else 'resettable'}  ({r['created'] or '?'})")
+    print(data["note"])
 
 def cmd_card_test(args):
     """Read-only proof that a provisioned card authenticates and yields a factor.
     Does not touch any wallet file; safe to run anytime."""
     cs = _card_module(); cs.disable_core_dumps()
     with card_reader(cs) as t:
-        factor, auth = cs.read_factor(t)
+        factor, auth = read_card(cs, t)
     event("card-ok")
     try:
         fam = cs.family_of(factor.bytes())
@@ -1387,17 +1674,30 @@ def cmd_send(args):
             decoded = rpc.call("decoderawtransaction", [t["hex"]])
             t.update(txid=decoded.get("txid"), size=len(t["hex"]) // 2, vsize=decoded.get("vsize"),
                      mempool_accept=bool(verdict.get("allowed")))
-            if not verdict.get("allowed"): t["reject_reason"] = verdict.get("reject-reason", "unknown")
-    bad = [(i, t) for i, t in enumerate(txs, 1) if t["mempool_accept"] is False]
+            if not verdict.get("allowed"):
+                t["reject_reason"] = " ".join(str(verdict.get("reject-reason") or "rejected").split())
+                # the node already has it (an earlier send got it out): not a refusal; the broadcast
+                # below records it under its txid (the node answers with it, or -27 once it is in a block)
+                t["already_out"] = BroadcastRejected.is_already(t["reject_reason"])
+    bad = [(i, t) for i, t in enumerate(txs, 1) if t["mempool_accept"] is False and not t.get("already_out")]
     if bad and not args.dry_run:
+        # the node ANSWERED no before anything went out: certain, and none of them was sent
         i, t = bad[0]
-        raise WalletError(f"node would reject {'this transaction' if n == 1 else f'transaction {i} of {n}'} "
-                          f"({t['reject_reason']}); nothing was broadcast")
+        event("rejected", i, n, reject_token(t["reject_reason"]))
+        raise WalletError("Nothing was sent: " + ("" if n == 1 else f"the node refused transaction {i} of {n}, so none of the {n} was broadcast: ")
+                          + f"{reject_plain(t['reject_reason'])} ({t['reject_reason']})")
 
     sent, error = [], None
     if not args.dry_run: broadcast_begin(n)
     for i, t in enumerate([] if args.dry_run else txs, 1):
         try: t["txid"] = rpc.call("sendrawtransaction", [t["hex"]])
+        except BroadcastRejected as e:
+            if not e.already_out:
+                if not sent:    # the network answered no: certain, nothing went out
+                    event("rejected", i, n, reject_token(e.reason))
+                    raise WalletError(f"Nothing was sent: {reject_plain(e.reason)} ({e.reason})") from e
+                error = e; break
+            # the network already has it (same txid, computed before the send): it IS out
         except Exception as e:
             if not sent:        # a lost connection can hide a success: name what to look up
                 raise WalletError(f"{e}. Nothing is confirmed sent, but if the connection dropped it may have gone out: "
@@ -1405,6 +1705,7 @@ def cmd_send(args):
                                   + (f" (the other {n - 1} transactions were never broadcast)" if n > 1 else "")) from e
             error = e; break    # earlier ones are out (independent coins): report exactly those
         sent.append(t); event("broadcast", i, n, t["txid"])
+    refused = isinstance(error, BroadcastRejected)   # the one that failed was refused, not lost: it did not go out
 
     shown = txs if args.dry_run else sent
     if not split:
@@ -1423,6 +1724,7 @@ def cmd_send(args):
         if bad: data["reject_reason"] = bad[0][1]["reject_reason"] if n == 1 else "; ".join(f"transaction {i}: {t['reject_reason']}" for i, t in bad)
         if error is not None:   # a lost connection can hide a success: name what to look up
             data.update(broadcast_error=str(error), unsent_txids=[t["txid"] for t in txs[len(sent):]])
+            if refused: data["broadcast_rejected"] = True   # ...unless the network answered no: then none of them is out
     if args.json: emit_json(data)
     elif n == 1:
         t = txs[0]
@@ -1430,18 +1732,27 @@ def cmd_send(args):
         else:
             say(f"Dry run: signed OK, NOT broadcast.\nTXID: {t['txid']}\nSigned bytes: {t['size']} ({t['vsize']} vbytes)")
             say("Mempool check: performed by the explorer at broadcast" if t["mempool_accept"] is None else
-                "Mempool check: would be accepted" if t["mempool_accept"] else f"Mempool check: would be REJECTED ({t['reject_reason']})")
+                "Mempool check: would be accepted" if t["mempool_accept"] else
+                f"Mempool check: already on the network ({t['reject_reason']})" if t.get("already_out") else
+                f"Mempool check: would be REJECTED ({t['reject_reason']})")
     else:
         say(f"Dry run: {n} transactions signed OK, NOT broadcast." if args.dry_run else
             f"Broadcast successful: {n} transactions" if error is None else
+            f"PARTIAL SEND: {len(sent)} of {n} transactions broadcast; the network refused transaction {len(sent) + 1}: "
+            f"{reject_plain(error.reason)} ({error.reason})" if refused else
             f"PARTIAL SEND: {len(sent)} of {n} transactions broadcast; transaction {len(sent) + 1} failed: {error}")
         for i, t in enumerate(txs, 1):
-            # the one that failed is UNKNOWN (a lost connection can hide a success); later ones were never tried
-            check = (("" if i <= len(sent) else "  UNKNOWN: look it up" if i == len(sent) + 1 else "  NOT SENT") if not args.dry_run else
+            # the one that failed is UNKNOWN (a lost connection can hide a success) unless the network
+            # refused it; later ones were never tried
+            check = (("" if i <= len(sent) else "  UNKNOWN: look it up" if i == len(sent) + 1 and not refused else
+                      "  NOT SENT: the network refused it" if i == len(sent) + 1 else "  NOT SENT") if not args.dry_run else
                      "  (mempool check at broadcast)" if t["mempool_accept"] is None else
-                     "  (would be accepted)" if t["mempool_accept"] else f"  (would be REJECTED: {t['reject_reason']})")
+                     "  (would be accepted)" if t["mempool_accept"] else
+                     f"  (already on the network: {t['reject_reason']})" if t.get("already_out") else f"  (would be REJECTED: {t['reject_reason']})")
             say(f"  {i}/{n}  TXID: {t['txid']}  pays {fmt(t['pay'])}, fee {fmt(t['fee'])}, {t['vsize']} vbytes{check}")
-        if error is not None:
+        if refused:
+            say(f"Paid {fmt(data['amount'])} of {fmt(amount)}. The NOT SENT transactions were never broadcast.")
+        elif error is not None:
             say(f"Paid {fmt(data['amount'])} of {fmt(amount)}. Look up {txs[len(sent)]['txid']} before paying the rest again: "
                 "if the connection dropped it may have gone out." + (" The NOT SENT transactions were never broadcast." if len(sent) + 1 < n else ""))
     event("done")
@@ -1643,7 +1954,11 @@ def parser():
     q.add_argument("--resettable", action="store_true", help="keep factory-key rollback (card can be reset); default is permanent/sealed")
     q.set_defaults(fn=cmd_new)
     q = sub.add_parser("card-provision", help="alias: create a card-bound wallet"); q.add_argument("--offline", action="store_true"); q.add_argument("--label"); q.add_argument("--resettable", action="store_true"); q.set_defaults(fn=cmd_new, card=True, no_clear=True)
-    q = sub.add_parser("card-backup", help="make a duplicate backup card for a card wallet"); q.add_argument("--label"); q.add_argument("--resettable", action="store_true"); q.set_defaults(fn=cmd_card_backup)
+    q = sub.add_parser("card-backup", help="make a duplicate backup card for a card wallet"); q.add_argument("--label"); q.add_argument("--resettable", action="store_true")
+    q.add_argument("--auto-swap", action="store_true", help="detect the card swap on the reader instead of waiting for Enter (for a parent program; events under XCOIN_EVENTS=1)")
+    q.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS); q.set_defaults(fn=cmd_card_backup)
+    q = sub.add_parser("card-status", help="the cards that unlock this card wallet (no tap, no passphrase)")
+    q.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS); q.set_defaults(fn=cmd_card_status)
     q = sub.add_parser("card-test", help="prove a provisioned card authenticates (read-only)"); q.set_defaults(fn=cmd_card_test)
     q = sub.add_parser("card-reset", help="factory-reset a card and remove its key file"); q.add_argument("--yes", action="store_true"); q.set_defaults(fn=cmd_card_reset)
     q = sub.add_parser("card-list", help="list provisioned cards on this Mac"); q.set_defaults(fn=cmd_card_list)
@@ -1695,6 +2010,8 @@ def parser():
     return p
 
 def main(argv=None):
+    global COMMITTED
+    COMMITTED = False   # every run starts before its commit point (a test may run several in one process)
     if os.getenv("XCOIN_WALLET_PASSPHRASE") is not None:
         print("error: XCOIN_WALLET_PASSPHRASE is not accepted: an environment variable is readable by every "
               "program you run and lands in shell history in plain text. Type the passphrase when asked, "
@@ -1723,12 +2040,10 @@ def main(argv=None):
     except WalletError as e:
         say(f"error: {e}", sys.stderr); return 1
     except Exception as e:
-        # card_seed.CardError (lazily imported) and other card/hardware faults
-        try: from card_seed import CardError
-        except Exception: CardError = ()
-        if CardError and isinstance(e, CardError):
-            say(f"error: {e}", sys.stderr); return 1
-        raise
+        # card_seed.CardError (lazily imported) and every pyscard / PC-SC fault: one plain line, no traceback
+        line = card_error_line(e, getattr(args, "command", None))
+        if line is None: raise
+        say(f"error: {line}", sys.stderr); return 1
     return 0
 
 if __name__ == "__main__": raise SystemExit(main())

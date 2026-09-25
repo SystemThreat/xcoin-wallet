@@ -96,7 +96,8 @@ Global options: `--file <wallet>`, `--config <nex.conf>`, `--rpc-host/-port/-use
 | `info` | Chain, sync state, peers, mempool, and relay-fee status. |
 | `seed [--copy [--timeout S]] [--yes]` | Re-display the seed (type `REVEAL`) or copy it to the clipboard. |
 | `card-provision` (`new --card`) | Create a **card-bound** wallet on an NTAG 424 DNA card — the seed is never displayed. |
-| `card-backup` | Provision a duplicate backup card that unlocks the same wallet. |
+| `card-backup [--auto-swap]` | Provision a duplicate backup card that unlocks the same wallet. `--auto-swap` sees the swap on the reader (wallet card off, blank card on) instead of waiting for Enter; a card that is not factory-fresh, or the wallet card put back, is refused before anything is written. |
+| `card-status` | Which cards unlock this card wallet (from `~/.xcoin` key files; no tap, no passphrase). `backup_supported` is `false`, with a `note` saying why, when no backup card can be made on this Mac: no key file for the wallet's cards here (they were set up on another Mac), the card software is not installed (`pyscard`, which the reader needs, or `cryptography`; each is checked by importing it, and the note names only the missing ones), or a dex-era wallet (made with dex-wallet-cli, where its backup cards are made). |
 | `card-test` | Prove a provisioned card authenticates and yields its factor (read-only). |
 | `card-list` | List provisioned cards known to this Mac. |
 | `card-reset --yes` | Factory-reset a card and retire its key file (refused on permanent cards). |
@@ -191,7 +192,10 @@ plus this open-source tool could decode it.
 - `--max-fee` (default 0.1 XCF) refuses runaway fees.
 - Change below 0.0001 XCF (the 10,000-sat consensus output floor) is folded into the fee instead of creating dust.
 - Every transaction is checked with `testmempoolaccept` before broadcast — a spend the
-  network would reject (e.g. immature coinbase) never leaves the wallet.
+  network would reject (e.g. immature coinbase) never leaves the wallet. On the node path a
+  refusal there ends like a refused broadcast (`Nothing was sent: …` and the `rejected`
+  event; in a split send it names the refused transaction and none is broadcast); a
+  transaction the node says it already has goes on to the broadcast and counts as sent.
 - `--dry-run` signs, decodes, and policy-checks without broadcasting anything.
 - One transaction carries at most 72 ML-DSA inputs (the node's 400,000 WU standard
   weight). A payment needing more fails with "split the send"; `--split` instead plans
@@ -203,6 +207,22 @@ plus this open-source tool could decode it.
   The first of `unsent_txids` is the one whose broadcast failed: a lost connection can
   hide its success, so look it up before paying the rest again (the others were never
   tried). A failed first broadcast exits 1 and names that txid the same way.
+- A **refusal** is told apart from a **lost connection**. When the explorer or the node
+  answers that it refuses a transaction (the explorer's `400 {"error": "rejected",
+  "reason": ...}`, `bad_hex`, `too_large`; the node's RPC errors -26, -25, -22), it was
+  not accepted and not relayed: a refused first transaction exits 1 with
+  `error: Nothing was sent: <reason in plain words> (<the network's own reason>)`, for
+  example "these coins are already being spent by an earlier send that has not confirmed
+  yet. Wait for the next block, then send again. (replacement-failed)". The explorer runs
+  the node's `testmempoolaccept` first, so this chain answers `missing-inputs` for coins
+  that were already spent ("these coins were already spent.") and `insufficient fee` or
+  `replacement-failed` for coins already in an unconfirmed send. A refused later
+  one keeps the partial-send report above, adds `"broadcast_rejected": true`, and marks it
+  `NOT SENT: the network refused it`. `txn-already-in-mempool`, `txn-already-known`,
+  "Transaction already in block chain" / "…already in utxo set" (RPC -27) mean the network
+  already has that transaction: it counts as sent under the txid computed before the send.
+  Only a timeout, a dropped connection or an answer that is no verdict (503 from the
+  explorer, a warming-up node) keeps the "Nothing is confirmed sent, … look up <txid>" wording.
 
 ### Offline signing (seed never touches the node)
 
@@ -261,6 +281,18 @@ xcoin-wallet card-backup --file ~/.xcoin/wallet001.mmm
 xcoin-wallet card-test                 # verify a card without touching a wallet
 xcoin-wallet card-list                 # cards provisioned on this Mac
 ```
+
+**Card and reader faults.** If the reader resets the card (or loses it for a moment) in
+the middle of a *read*, the CLI reconnects and reads again, at most twice: keep the card
+on the reader. A fault in the middle of a *write* (a new card, a backup card, a reset) is
+never retried and is reported as "did not finish … do not rely on that card". Every card
+or reader fault ends in one line, `error: <what happened>; <what was or was not done>`
+(for example "nothing was sent" or "nothing was written"), with exit code 1 and no Python
+traceback. That includes pyscard's low-level `scard.error` and faults from below pyscard
+during a read or a write (an OSError or timeout from the reader's driver, an answer that
+makes no sense). Reader-level faults add "If this keeps happening, unplug the card reader,
+plug it back in, and try again." A key file that cannot be saved during a write (a full
+or read-only disk) is named as that, without the reader hint.
 
 **How it works — genuine two-factor decryption.** A random 32-byte *card factor* is
 written into the chip's proprietary file, which the chip releases only after AES
@@ -350,7 +382,7 @@ nothing persists. They exist only to run the wallet headless/scripted.
 | `XCOIN_RPC_USER` / `XCOIN_RPC_PASSWORD` | **secret** | Node RPC login, used only if not passed via `--rpc-user/--rpc-password` or found in `nex.conf`. Keeps the RPC password off the command line (where `ps` would show it). This is the *node's* password, not your seed. |
 | `HOME` | config | Locates `~/.xcoin/`. Standard; set by your shell. |
 | `XCOIN_CARD_TIMEOUT` | config | Seconds to wait for a card tap (default 60, 5..300). The wait watches the reader's PICC interface with `SCardGetStatusChange` and connects once the card is there. |
-| `XCOIN_EVENTS` | config | `1`: machine-readable progress on stderr for a parent program (MMM): `XCOIN-EVENT card-wait <s>` before every card tap (unlock, `new --card`, `card-backup`, `card-test`, `card-reset`) and `card-ok` after it succeeds; `signing <i> <n>`; `broadcast-begin <n>` just before the first broadcast (from here the parent must not stop the CLI; a 0.5 s pause follows so a cancel already on its way lands before anything is sent; if the parent quits or dies, the CLI still attempts every broadcast: SIGPIPE is ignored and output to a closed pipe is dropped); `broadcast <i> <n> <txid>` per accepted transaction; `done`. |
+| `XCOIN_EVENTS` | config | `1`: machine-readable progress on stderr for a parent program (MMM): `XCOIN-EVENT card-wait <s>` before every card tap (unlock, `new --card`, `card-backup`, `card-test`, `card-reset`) and `card-ok` after it succeeds; `card-retry <attempt>` when the reader reset the card (or lost it) mid-read and the read is tried again (attempt 1 or 2; the card stays on the reader; never during a write); `card-backup --auto-swap` adds `card-swap` (take the wallet card off, place a blank one), `card-removed`, `card-provisioning` (the commit point of the backup, like `broadcast-begin`: a strict write, so a parent already gone means nothing is written; then a 0.5 s pause in which a cancel already on its way still stops the run with the blank card untouched; from the first write until the backup's key file is sealed, SIGTERM and SIGPIPE are ignored so the card is never left half written) and `done`; `new --card` sends `card-provisioning` the same way once the blank card passed its checks (same strict write and pause), and holds SIGTERM and SIGPIPE off from its first write until the card is sealed and the wallet file is written (its passphrase is asked before the card is touched); `signing <i> <n>`; `broadcast-begin <n>` just before the first broadcast (from here the parent must not stop the CLI; a 0.5 s pause follows so a cancel already on its way lands before anything is sent; if the parent quits or dies, the CLI still attempts every broadcast: SIGPIPE is ignored and output to a closed pipe is dropped); `broadcast <i> <n> <txid>` per accepted transaction (also when the network answers it already has it); `rejected <i> <n> <reason>` just before the error when the explorer or node refused the first transaction, or the node path's own check refused transaction `<i>` before anything went out (nothing was sent; `<reason>` is one token such as `missing-inputs`, `replacement-failed`, `insufficient-fee` or `bad-txns-inputs-missingorspent`); `done`. |
 | `NEX` | config | `build.sh` only — path to the Xcoin source tree (to find the PQClean sources). |
 | `PREFIX` | config | `install.sh` only — install prefix for the CLI symlinks (default `~/.local`). |
 

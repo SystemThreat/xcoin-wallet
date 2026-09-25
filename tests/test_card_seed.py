@@ -371,6 +371,88 @@ class TestCardWait(unittest.TestCase):
             os.environ["XCOIN_CARD_TIMEOUT"] = v
             self.assertEqual(cs.card_timeout(), want, v)
 
+class TestCardRemoval(unittest.TestCase):
+    """PCSCTransport.wait_for_removal: the swap to a blank card is seen on the reader
+    (SCardGetStatusChange), never by a connect or an Enter key."""
+    def setUp(self):
+        for k in ("XCOIN_CARD_TIMEOUT",): self.addCleanup(os.environ.pop, k, None); os.environ.pop(k, None)
+    def test_taken_off_after_polls_never_connects(self):
+        fake = FakePCSC([SAM, PICC], [{PICC: PRESENT}, None, None, {PICC: EMPTY}]).install(self)
+        cs.PCSCTransport().wait_for_removal()
+        self.assertEqual((fake.connected, len(fake.calls)), ([], 4))
+        self.assertEqual({n for _, st in fake.calls for n, _ in st}, {PICC})  # the SAM slot is never watched
+        self.assertEqual(fake.calls[0][1], [(PICC, SC.SCARD_STATE_UNAWARE)])
+        self.assertTrue(all(st == [(PICC, PRESENT)] for _, st in fake.calls[1:]))   # blocks on the known state
+        self.assertEqual(fake.contexts, 0)
+    def test_own_handle_released_before_the_wait(self):
+        fake = FakePCSC([PICC], [{PICC: PRESENT}, {PICC: EMPTY}]).install(self)
+        t = cs.PCSCTransport()
+        with redirect_stderr(io.StringIO()): t.wait_for_card(timeout=5)
+        seen = []; t.conn.disconnect = lambda: seen.append(len(fake.calls))
+        t.wait_for_removal(timeout=5)
+        self.assertEqual((seen, t.conn, len(fake.calls)), ([1], None, 2))
+    def test_already_off_the_reader(self):
+        fake = FakePCSC([PICC], [{PICC: EMPTY}]).install(self)
+        cs.PCSCTransport().wait_for_removal(timeout=5)
+        self.assertEqual(len(fake.calls), 1)
+    def test_mute_card_is_still_on_the_reader(self):
+        fake = FakePCSC([PICC], [{PICC: PRESENT | SC.SCARD_STATE_MUTE}, {PICC: EMPTY}]).install(self)
+        cs.PCSCTransport().wait_for_removal(timeout=5)
+        self.assertEqual((fake.connected, len(fake.calls)), ([], 2))
+    def test_never_taken_off_times_out_on_the_card_budget(self):
+        os.environ["XCOIN_CARD_TIMEOUT"] = "7"
+        fake = FakePCSC([PICC], [{PICC: PRESENT}]).install(self)
+        with self.assertRaisesRegex(cs.CardError, "not taken off the reader in time"):
+            cs.PCSCTransport().wait_for_removal()
+        self.assertEqual(fake.connected, [])
+        self.assertTrue(8 <= len(fake.calls) <= 9)                       # ~1 blocking call per second of the 7 s budget
+        self.assertEqual(fake.contexts, 0)
+    def test_reader_unplugged(self):
+        FakePCSC([PICC], [{PICC: SC.SCARD_STATE_UNKNOWN}]).install(self)
+        with self.assertRaisesRegex(cs.CardError, "went away"):
+            cs.PCSCTransport().wait_for_removal(timeout=5)
+    def test_no_reader(self):
+        FakePCSC([], []).install(self)
+        with self.assertRaisesRegex(cs.CardError, "no PC/SC reader"):
+            cs.PCSCTransport().wait_for_removal()
+
+class TestBlankCardGuard(CardHarness):
+    """provision_card refuses, before any write, a card that is not factory-fresh
+    or is the wallet card itself; before_write runs once, just ahead of the first write."""
+    def provision(self, **kw):
+        f = cs.SecureBuffer(os.urandom(32))
+        try: return cs.provision_card(cs.PCSCTransport(), f, cs.family_of(f.bytes()), **kw)
+        finally: f.close()
+    def test_any_key_off_factory_is_refused_untouched(self):
+        for key_no in (cs.KEY_APP_MASTER, cs.KEY_READ, cs.KEY_WRITE):
+            card = fresh_factory_card(); card.keys[key_no] = os.urandom(16); self.use_card(card)
+            keys = dict(card.keys)
+            with self.assertRaisesRegex(cs.CardError, "not blank.*nothing was written"):
+                self.provision(before_write=lambda: self.fail("before_write ran"))
+            self.assertEqual((card.keys, card.files[cs.CARD_FILE]), (keys, bytearray(128)), key_no)
+            self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
+    def test_card_of_a_wallet_on_another_computer(self):
+        with tempfile.TemporaryDirectory() as elsewhere, mock.patch.object(cs, "AUTH_DIR", Path(elsewhere)):
+            self.provision()
+        data = bytes(self.card.files[cs.CARD_FILE])
+        with self.assertRaisesRegex(cs.CardError, "not blank"): self.provision()
+        self.assertEqual(bytes(self.card.files[cs.CARD_FILE]), data)
+        self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
+    def test_excluded_uid_refused(self):
+        with self.assertRaisesRegex(cs.CardError, "is the wallet card itself.*nothing was written"):
+            self.provision(exclude={self.card.uid_bytes.hex()}, before_write=lambda: self.fail("before_write ran"))
+        self.assertEqual((self.card.keys[0], self.card.files[cs.CARD_FILE]), (cs.FACTORY_KEY, bytearray(128)))
+    def test_before_write_runs_once_before_the_factor_lands(self):
+        seen = []
+        rec = self.provision(exclude={"04ffffffffffff"}, before_write=lambda: seen.append(bytes(self.card.files[cs.CARD_FILE][:32])))
+        self.assertEqual(seen, [bytes(32)])
+        self.assertEqual(rec["state"], "provisioned")
+    def test_reset_card_is_blank_again(self):
+        rec = self.provision()
+        cs.factory_reset_card(cs.PCSCTransport())
+        cs.auth_path(rec["uid"]).rename(cs.auth_path(rec["uid"]).with_suffix(".auth.removed"))   # what card-reset does
+        self.assertEqual(self.provision()["uid"], rec["uid"])
+
 class TestUnlockEvents(CardHarness):
     """XCOIN_EVENTS=1: a card unlock announces the wait and the unlocked seed on stderr."""
     def setUp(self):

@@ -32,6 +32,17 @@ from cryptography.hazmat.primitives import cmac as _cmac_mod
 
 class CardError(RuntimeError): pass
 
+class ReaderError(CardError):
+    """The reader or the Mac's PC/SC service failed, not the card's answer: unplugging
+    the reader and plugging it back in is the fix worth suggesting."""
+
+class CardWriteError(CardError):
+    """A fault after the first write to a card began: the card may be half written.
+    Never retried. `cause` is the original fault."""
+    def __init__(self, message, cause=None):
+        super().__init__(message)
+        self.cause = cause
+
 FACTOR_LEN = 32
 CARD_FILE = 0x03            # proprietary file, 128 bytes, CommMode.FULL from factory
 FACTOR_OFFSET = 0
@@ -140,6 +151,16 @@ def card_timeout():
     try: return max(5, min(300, int(os.environ["XCOIN_CARD_TIMEOUT"])))
     except (KeyError, ValueError): return CARD_TIMEOUT
 
+def pcsc_available():
+    """True when pyscard, the PC/SC library PCSCTransport needs, imports with this Python. This
+    module itself loads with cryptography alone, so loading it says nothing about the reader."""
+    try:
+        from smartcard.System import readers  # noqa: F401
+        from smartcard import scard  # noqa: F401
+    except Exception:
+        return False
+    return True
+
 class PCSCTransport:
     """Thin PC/SC wrapper (ACR1252 or any PC/SC reader)."""
     def __init__(self):
@@ -151,45 +172,62 @@ class PCSCTransport:
             raise CardError("pyscard not installed (pip3 install pyscard)")
         self._readers, self._NoCard, self._scard = readers, NoCardException, scard
         self.conn = None
+    def _interfaces(self):
+        rs = self._readers()
+        if not rs: raise ReaderError("no PC/SC reader found — plug in the ACR1252")
+        # the ACR1252's contactless interface is its PICC one (its SAM slot never holds the card)
+        return {str(r): r for r in rs if "PICC" in str(r).upper()} or {str(r): r for r in rs}
+    def _watch(self, names, timeout, step):
+        """SCardGetStatusChange on `names` until step(reported) is true (True), or False once
+        the budget is spent. 1 s slices keep Ctrl-C live; handing back the last state is what
+        makes each call block."""
+        sc = self._scard
+        hr, ctx = sc.SCardEstablishContext(sc.SCARD_SCOPE_USER)
+        if hr != sc.SCARD_S_SUCCESS: raise ReaderError(f"PC/SC unavailable: {sc.SCardGetErrorMessage(hr)}")
+        try:
+            states, deadline = [(n, sc.SCARD_STATE_UNAWARE) for n in names], time.monotonic() + timeout
+            while (left := deadline - time.monotonic()) > 0:
+                hr, got = sc.SCardGetStatusChange(ctx, max(1, int(min(left, 1.0) * 1000)), states)
+                if hr not in (sc.SCARD_S_SUCCESS, sc.SCARD_E_TIMEOUT):
+                    raise ReaderError(f"card reader wait failed: {sc.SCardGetErrorMessage(hr)}")
+                if hr == sc.SCARD_S_SUCCESS:
+                    if all(ev & sc.SCARD_STATE_UNKNOWN for _, ev, _ in got): raise ReaderError("the card reader went away")
+                    if step(got): return True
+                    states = [(n, ev & ~sc.SCARD_STATE_CHANGED) for n, ev, _ in got]
+                time.sleep(0.05)                     # a driver that returns at once must not spin
+            return False
+        finally:
+            sc.SCardReleaseContext(ctx)
     def wait_for_card(self, timeout=None, prompt=True):
         """Wait for presence with SCardGetStatusChange, then SCardConnect once per
         arrival. Never poll with SCardConnect: one that hung mid-poll wedged the
         reader for every later process."""
         timeout = card_timeout() if timeout is None else timeout
-        rs = self._readers()
-        if not rs: raise CardError("no PC/SC reader found — plug in the ACR1252")
-        # the ACR1252's contactless interface is its PICC one (its SAM slot never holds the card)
-        cand = {str(r): r for r in rs if "PICC" in str(r).upper()} or {str(r): r for r in rs}
+        cand = self._interfaces()
         if prompt: print(f"Tap and hold the card on the reader ({len(cand)} interface(s))...", file=sys.stderr)
+        sc, tried, failed = self._scard, set(), None
+        def arrived(got):
+            nonlocal failed
+            for name, ev, _atr in got:
+                if not ev & sc.SCARD_STATE_PRESENT: tried.discard(name); continue
+                if name in tried or ev & (sc.SCARD_STATE_MUTE | sc.SCARD_STATE_EXCLUSIVE): continue
+                tried.add(name)
+                conn = cand[name].createConnection()
+                try: conn.connect()
+                except Exception as e:       # left the field mid-tap: wait for the next arrival
+                    failed = e; continue
+                self.conn = conn; return True
+            return False
+        if not self._watch(cand, timeout, arrived):
+            raise ReaderError("no card presented in time" + (f" (last connect failed: {failed})" if failed else ""))
+    def wait_for_removal(self, timeout=None):
+        """Return once no card is on the reader: the same status wait, never a connect
+        and never a key press. Our own handle goes first so it cannot hold the card."""
+        timeout = card_timeout() if timeout is None else timeout
+        self.close()
         sc = self._scard
-        hr, ctx = sc.SCardEstablishContext(sc.SCARD_SCOPE_USER)
-        if hr != sc.SCARD_S_SUCCESS: raise CardError(f"PC/SC unavailable: {sc.SCardGetErrorMessage(hr)}")
-        try:
-            states, tried, failed = [(n, sc.SCARD_STATE_UNAWARE) for n in cand], set(), None
-            deadline = time.monotonic() + timeout
-            while True:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    raise CardError("no card presented in time" + (f" (last connect failed: {failed})" if failed else ""))
-                # 1 s slices keep Ctrl-C live; handing back the last state is what makes each call block
-                hr, got = sc.SCardGetStatusChange(ctx, max(1, int(min(left, 1.0) * 1000)), states)
-                if hr not in (sc.SCARD_S_SUCCESS, sc.SCARD_E_TIMEOUT):
-                    raise CardError(f"card reader wait failed: {sc.SCardGetErrorMessage(hr)}")
-                if hr == sc.SCARD_S_SUCCESS:
-                    if all(ev & sc.SCARD_STATE_UNKNOWN for _, ev, _ in got): raise CardError("the card reader went away")
-                    for name, ev, _atr in got:
-                        if not ev & sc.SCARD_STATE_PRESENT: tried.discard(name); continue
-                        if name in tried or ev & (sc.SCARD_STATE_MUTE | sc.SCARD_STATE_EXCLUSIVE): continue
-                        tried.add(name)
-                        conn = cand[name].createConnection()
-                        try: conn.connect()
-                        except Exception as e:       # left the field mid-tap: wait for the next arrival
-                            failed = e; continue
-                        self.conn = conn; return
-                    states = [(n, ev & ~sc.SCARD_STATE_CHANGED) for n, ev, _ in got]
-                time.sleep(0.05)                     # a driver that returns at once must not spin
-        finally:
-            sc.SCardReleaseContext(ctx)
+        if not self._watch(self._interfaces(), timeout, lambda got: not any(ev & sc.SCARD_STATE_PRESENT for _, ev, _ in got)):
+            raise CardError("the card was not taken off the reader in time")
     def transmit(self, apdu):
         resp, sw1, sw2 = self.conn.transmit(list(apdu))
         return bytes(resp), sw1, sw2
@@ -426,6 +464,7 @@ class SimNTAG424:
 class SimTransport:
     def __init__(self, card): self.card = card
     def wait_for_card(self, timeout=None, prompt=True): pass
+    def wait_for_removal(self, timeout=None): pass
     def transmit(self, apdu): return tuple(self.card.transmit(apdu)) if False else self._t(apdu)
     def _t(self, apdu):
         resp, sw1, sw2 = self.card.transmit(apdu)
@@ -440,7 +479,8 @@ def auth_path(uid_hex):
 def load_auth(uid_hex):
     p = auth_path(uid_hex)
     if not p.exists(): raise CardError(f"card {uid_hex} is not provisioned for this wallet (no {p.name})")
-    return json.loads(p.read_text())
+    try: return json.loads(p.read_text())
+    except (OSError, ValueError) as e: raise CardError(f"the key file {p.name} of card {uid_hex} cannot be read ({e})") from None
 
 def save_auth(record):
     AUTH_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -449,6 +489,11 @@ def save_auth(record):
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f: json.dump(record, f, indent=2)
     return p
+
+def _one_line(e):
+    """An exception as one line of text (a KeyboardInterrupt says so)."""
+    text = " ".join(str(e).split()) or type(e).__name__
+    return "interrupted" if isinstance(e, KeyboardInterrupt) else text
 
 def _connect(transport):
     card = NTAG424(transport)
@@ -465,11 +510,30 @@ def _update_auth(uid_hex, updates):
     os.replace(tmp, p)
     return rec
 
-def provision_card(transport, factor, family, label=""):
+def _key_file_step(uid_hex, step, *args):
+    """save_auth / _update_auth inside a card write: a failure of this Mac's disk (full, not
+    writable) is named as such, a CardError, so it is never taken for a fault of the reader."""
+    try: return step(*args)
+    except (OSError, ValueError) as e:
+        raise CardError(f"the key file for card {uid_hex} could not be saved on this Mac: {_one_line(e)}") from e
+
+def require_blank(card, uid_hex):
+    """Refuse, before anything is written, a card whose master, read or write key is off
+    factory: it belongs to a wallet (maybe on another computer) and provisioning needs all three."""
+    for key_no in (KEY_APP_MASTER, KEY_READ, KEY_WRITE):
+        try: card.auth_ev2(key_no, FACTORY_KEY)
+        except CardError:
+            raise CardError(f"card {uid_hex} is not blank (its keys were changed: it already belongs to a wallet) — "
+                            "use a NEW factory-fresh card; nothing was written") from None
+
+def provision_card(transport, factor, family, label="", exclude=(), before_write=None):
     """Provision a FACTORY card and store the factor. Saves the auth file itself
     (the caller no longer calls save_auth) and returns the record.
 
     Order is chosen for safety and to isolate faults:
+      0. Refuse a UID in `exclude` (the wallet card placed again), a card with an
+         auth file here, or one whose keys are off factory — nothing written yet.
+         `before_write` runs once the card has passed, just before the first write.
       1. Write + verify the factor using the KNOWN factory keys (Write=key3,
          Read=key2 are factory here) — any WriteData fault happens while the card
          is still all-factory (recoverable / no brick).
@@ -481,32 +545,40 @@ def provision_card(transport, factor, family, label=""):
     transport.wait_for_card()
     card = _connect(transport)
     uid_hex = card.uid().hex()
+    if uid_hex in exclude:
+        raise CardError(f"card {uid_hex} is the wallet card itself — take it off and place a NEW blank card; nothing was written")
     if auth_path(uid_hex).exists():
         raise CardError(f"card {uid_hex} is already provisioned — use a factory card")
-    read_key, write_key, master_key = (secrets.token_bytes(16) for _ in range(3))
-    # 1) write + verify with factory keys (isolates any WriteData fault safely)
-    card.auth_ev2(KEY_WRITE, FACTORY_KEY)
-    card.write_full(CARD_FILE, FACTOR_OFFSET, factor.bytes())
-    card.auth_ev2(KEY_READ, FACTORY_KEY)
-    if card.read_full(CARD_FILE, FACTOR_OFFSET, FACTOR_LEN) != factor.bytes():
-        raise CardError("factor write/verify failed with factory keys — card left untouched")
-    # 2) persist the keys BEFORE rotating (crash-safety recovery point)
-    record = {"version": 3, "uid": uid_hex, "family": family, "label": label,
-              "read_key_no": KEY_READ, "read_key": read_key.hex(),
-              "master_key": master_key.hex(), "write_key": write_key.hex(),
-              "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-              "permanent": False, "state": "factor_written"}
-    save_auth(record)
-    # 3) rotate keys off factory (master session; master changed last)
-    card.auth_ev2(KEY_APP_MASTER, FACTORY_KEY)
-    card.change_key_diff(KEY_READ, read_key, FACTORY_KEY)
-    card.change_key_diff(KEY_WRITE, write_key, FACTORY_KEY)
-    card.change_key_same(KEY_APP_MASTER, master_key)
-    # verify unlock with the rotated read-only key
-    card.auth_ev2(KEY_READ, read_key)
-    if card.read_full(CARD_FILE, FACTOR_OFFSET, FACTOR_LEN) != factor.bytes():
-        raise CardError("verification read failed after key rotation")
-    return _update_auth(uid_hex, {"state": "provisioned"})
+    require_blank(card, uid_hex)
+    if before_write: before_write()
+    try:
+        read_key, write_key, master_key = (secrets.token_bytes(16) for _ in range(3))
+        # 1) write + verify with factory keys (isolates any WriteData fault safely)
+        card.auth_ev2(KEY_WRITE, FACTORY_KEY)
+        card.write_full(CARD_FILE, FACTOR_OFFSET, factor.bytes())
+        card.auth_ev2(KEY_READ, FACTORY_KEY)
+        if card.read_full(CARD_FILE, FACTOR_OFFSET, FACTOR_LEN) != factor.bytes():
+            raise CardError("factor write/verify failed with factory keys — card left untouched")
+        # 2) persist the keys BEFORE rotating (crash-safety recovery point)
+        record = {"version": 3, "uid": uid_hex, "family": family, "label": label,
+                  "read_key_no": KEY_READ, "read_key": read_key.hex(),
+                  "master_key": master_key.hex(), "write_key": write_key.hex(),
+                  "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                  "permanent": False, "state": "factor_written"}
+        _key_file_step(uid_hex, save_auth, record)
+        # 3) rotate keys off factory (master session; master changed last)
+        card.auth_ev2(KEY_APP_MASTER, FACTORY_KEY)
+        card.change_key_diff(KEY_READ, read_key, FACTORY_KEY)
+        card.change_key_diff(KEY_WRITE, write_key, FACTORY_KEY)
+        card.change_key_same(KEY_APP_MASTER, master_key)
+        # verify unlock with the rotated read-only key
+        card.auth_ev2(KEY_READ, read_key)
+        if card.read_full(CARD_FILE, FACTOR_OFFSET, FACTOR_LEN) != factor.bytes():
+            raise CardError("verification read failed after key rotation")
+        return _key_file_step(uid_hex, _update_auth, uid_hex, {"state": "provisioned"})
+    except (Exception, KeyboardInterrupt) as e:
+        # from the first write on a fault may leave the card half made: never retried, always named
+        raise CardWriteError(f"the write to card {uid_hex} did not finish ({_one_line(e)})", e) from e
 
 def make_permanent(uid_hex):
     """Seal a provisioned card: drop the master and write keys from its auth file,
@@ -550,13 +622,16 @@ def factory_reset_card(transport):
     if auth.get("permanent") or "master_key" not in auth or "write_key" not in auth:
         raise CardError("this card was provisioned PERMANENTLY (no factory-key rollback saved) — it cannot be reset")
     master, write_key, read_key = (bytes.fromhex(auth[k]) for k in ("master_key", "write_key", "read_key"))
-    # Wipe the factor (Write access = key3), then roll all keys back to factory.
-    card.auth_ev2(KEY_WRITE, write_key)
-    card.write_full(CARD_FILE, FACTOR_OFFSET, bytes(FACTOR_LEN))
-    card.auth_ev2(KEY_APP_MASTER, master)
-    card.change_key_diff(KEY_READ, FACTORY_KEY, read_key, key_version=0)
-    card.change_key_diff(KEY_WRITE, FACTORY_KEY, write_key, key_version=0)
-    card.change_key_same(KEY_APP_MASTER, FACTORY_KEY, key_version=0)
+    try:
+        # Wipe the factor (Write access = key3), then roll all keys back to factory.
+        card.auth_ev2(KEY_WRITE, write_key)
+        card.write_full(CARD_FILE, FACTOR_OFFSET, bytes(FACTOR_LEN))
+        card.auth_ev2(KEY_APP_MASTER, master)
+        card.change_key_diff(KEY_READ, FACTORY_KEY, read_key, key_version=0)
+        card.change_key_diff(KEY_WRITE, FACTORY_KEY, write_key, key_version=0)
+        card.change_key_same(KEY_APP_MASTER, FACTORY_KEY, key_version=0)
+    except (Exception, KeyboardInterrupt) as e:
+        raise CardWriteError(f"the reset of card {uid_hex} did not finish ({_one_line(e)})", e) from e
     return uid_hex
 
 def family_of(factor_bytes):
