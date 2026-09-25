@@ -69,7 +69,7 @@ def money(v, what="amount"):
 def money_ceil_sat(v):
     return v.quantize(Decimal("0.00000001"), rounding=ROUND_CEILING)
 
-def fmt(v): return f"{money(v):f} XCF"
+def fmt(v): return f"{money(v):f} XID"
 def fmt8(v): return f"{money(v):.8f}"
 
 def jdefault(o):
@@ -863,7 +863,7 @@ class ExplorerRPC:
         if method == "estimatesmartfee":
             out = self._get("/api/feerate")
             satvb = Decimal(str(out.get("feerate_sat_vb", 1)))
-            return {"feerate": satvb * 1000 / Decimal(100000000)}   # sat/vB -> XCF/kvB
+            return {"feerate": satvb * 1000 / Decimal(100000000)}   # sat/vB -> XID/kvB
         if method == "createrawtransaction":
             ins, outs = params[0], params[1]
             pairs = []
@@ -1085,7 +1085,7 @@ def fee_for(n_in, n_out, feerate):
     return money_ceil_sat(feerate * vsize / 1000)
 
 def resolve_feerate(rpc, args):
-    """Return (feerate XCF/kvB, source). Never below the node's relay floor."""
+    """Return (feerate XID/kvB, source). Never below the node's relay floor."""
     floor = Decimal("0.00001000")   # 1 sat/vB: the chain's DEFAULT_MIN_RELAY_TX_FEE
     try:
         mi = rpc.call("getmempoolinfo")
@@ -1978,11 +1978,11 @@ def parser():
     q.add_argument("--carried", action="store_true", help="also list each key's single-leaf (carried) address"); q.set_defaults(fn=cmd_addresses)
     for name, fn in (("balance", cmd_balance), ("status", cmd_balance), ("utxos", cmd_utxos)):
         q = sub.add_parser(name, help="show balance/UTXOs (maturity-aware; two-leaf and carried outputs)"); q.add_argument("--index", type=int, default=0); q.set_defaults(fn=fn)
-    q = sub.add_parser("send", help="send XCF (fee auto-estimated unless --fee)")
+    q = sub.add_parser("send", help="send XID (fee auto-estimated unless --fee)")
     q.add_argument("destination"); q.add_argument("amount")
-    q.add_argument("--fee", help="absolute fee in XCF (overrides --feerate)")
-    q.add_argument("--feerate", help="fee rate in XCF/kvB (default: auto)")
-    q.add_argument("--max-fee", default=str(DEFAULT_MAX_FEE), help=f"refuse fees above this (default {DEFAULT_MAX_FEE} XCF; with --split, the total)")
+    q.add_argument("--fee", help="absolute fee in XID (overrides --feerate)")
+    q.add_argument("--feerate", help="fee rate in XID/kvB (default: auto)")
+    q.add_argument("--max-fee", default=str(DEFAULT_MAX_FEE), help=f"refuse fees above this (default {DEFAULT_MAX_FEE} XID; with --split, the total)")
     q.add_argument("--split", action="store_true", help="pay an amount too large for one standard transaction as several independent ones, "
                    "all signed with one unlock (one card tap), then broadcast in turn")
     q.add_argument("--index", type=int, default=0); q.add_argument("--yes", action="store_true"); q.add_argument("--dry-run", action="store_true")

@@ -129,8 +129,8 @@ class TestExplorerRefusals(ExplorerBase):
         ("min relay fee not met, 100 < 5412", "its fee is below the network's minimum relay fee. Send again with a higher fee.", "min-relay-fee-not-met"),
         ("mempool min fee not met, 100 < 200", "its fee is below what the network accepts right now. Send again with a higher fee.", "mempool-min-fee-not-met"),
         ("bad-txout-below-min, every output that is not NULL_DATA must carry at least the chain's minimum value",
-         "an amount in it is below the network's smallest allowed output (0.00010000 XCF, 10,000 sat).", "bad-txout-below-min"),
-        ("dust", "an amount in it is below the network's smallest allowed output (0.00010000 XCF, 10,000 sat).", "dust"),
+         "an amount in it is below the network's smallest allowed output (0.00010000 XID, 10,000 sat).", "bad-txout-below-min"),
+        ("dust", "an amount in it is below the network's smallest allowed output (0.00010000 XID, 10,000 sat).", "dust"),
         ("non-final", "the network refused this transaction.", "non-final"),
     ]
     def test_explicit_refusal_says_nothing_was_sent(self):
@@ -298,7 +298,7 @@ class TestNodeRefusals(NodeBase):
         (-25, "Inputs missing or spent", SPENT, "inputs-missing-or-spent"),
         (-26, "min relay fee not met, 100 < 5412", "its fee is below the network's minimum relay fee. Send again with a higher fee.", "min-relay-fee-not-met"),
         (-26, "bad-txout-below-min, every output that is not NULL_DATA must carry at least the chain's minimum value",
-         "an amount in it is below the network's smallest allowed output (0.00010000 XCF, 10,000 sat).", "bad-txout-below-min"),
+         "an amount in it is below the network's smallest allowed output (0.00010000 XID, 10,000 sat).", "bad-txout-below-min"),
         (-22, "TX decode failed. Make sure the tx has at least one input.", "the transaction could not be read.", "tx-decode-failed"),
     ]
     def test_explicit_refusal_says_nothing_was_sent(self):
@@ -352,7 +352,7 @@ class TestNodeCheck(NodeBase):
     REFUSED = [("missing-inputs", SPENT, "missing-inputs"), ("replacement-failed", CONFLICT, "replacement-failed"),
                ("insufficient fee", CONFLICT, "insufficient-fee"),
                ("min relay fee not met", "its fee is below the network's minimum relay fee. Send again with a higher fee.", "min-relay-fee-not-met"),
-               ("bad-txout-below-min", "an amount in it is below the network's smallest allowed output (0.00010000 XCF, 10,000 sat).", "bad-txout-below-min"),
+               ("bad-txout-below-min", "an amount in it is below the network's smallest allowed output (0.00010000 XID, 10,000 sat).", "bad-txout-below-min"),
                ("non-final", "the network refused this transaction.", "non-final")]
     def test_refused_by_the_check_says_nothing_was_sent(self):
         for reason, plain, token in self.REFUSED:

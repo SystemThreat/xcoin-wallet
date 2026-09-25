@@ -1,6 +1,6 @@
 # xcoin-wallet
 
-A minimal, auditable **post-quantum** command-line wallet for xCoin (XCF).
+A minimal, auditable **post-quantum** command-line wallet for xCoin (XID).
 
 Every Xcoin address is a witness v3 script tree over **post-quantum keys only**: an
 **ML-DSA-65** (FIPS 204) leaf plus an **SLH-DSA-SHA2-128s** (FIPS 205, hash-based)
@@ -188,9 +188,9 @@ plus this open-source tool could decode it.
 - Fees default to **auto-estimation from real transaction size**: ML-DSA signatures are
   ~3.3 KB and pubkeys ~2 KB per input, so a 1-in/2-out spend is ~5.4 KB (~1455 vbytes).
   The rate comes from `estimatesmartfee`, else your `fallbackfee`, else the relay floor.
-  Override with `--feerate` (XCF/kvB) or an absolute `--fee`.
-- `--max-fee` (default 0.1 XCF) refuses runaway fees.
-- Change below 0.0001 XCF (the 10,000-sat consensus output floor) is folded into the fee instead of creating dust.
+  Override with `--feerate` (XID/kvB) or an absolute `--fee`.
+- `--max-fee` (default 0.1 XID) refuses runaway fees.
+- Change below 0.0001 XID (the 10,000-sat consensus output floor) is folded into the fee instead of creating dust.
 - Every transaction is checked with `testmempoolaccept` before broadcast — a spend the
   network would reject (e.g. immature coinbase) never leaves the wallet. On the node path a
   refusal there ends like a refused broadcast (`Nothing was sent: …` and the `rejected`

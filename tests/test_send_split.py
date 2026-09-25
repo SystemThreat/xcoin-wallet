@@ -70,7 +70,7 @@ class TestSplitPlanner(unittest.TestCase):
         self.assertTrue(all(u["amount"] == 5 for u in plan[0][0]))
         self.assertEqual(len(plan[0][0]), 72)
     def test_sub_floor_rest_keeps_floor_change_instead(self):
-        # 72 x 1 XCF spent whole would leave 0.00005 XCF for the next transaction: below the floor
+        # 72 x 1 XID spent whole would leave 0.00005 XID for the next transaction: below the floor
         fee72 = w.fee_for(72, 2, RATE)
         pool = coins(73, "1")
         amount = Decimal(72) - fee72 + Decimal("0.00005")
@@ -93,13 +93,13 @@ class TestSplitPlanner(unittest.TestCase):
             self.assertEqual((s, fee, change), w.select_coins(pool, amount, feerate=RATE))
             self.assertEqual(pay, amount)
     def test_without_split_the_cap_error_is_unchanged(self):
-        with self.assertRaisesRegex(w.WalletError, r"^one transaction can carry at most 72 inputs \(1008\.00000000 XCF from "
-                                    r"these UTXOs\); send at most about 1008\.00000000 XCF now and the rest in another send$"):
+        with self.assertRaisesRegex(w.WalletError, r"^one transaction can carry at most 72 inputs \(1008\.00000000 XID from "
+                                    r"these UTXOs\); send at most about 1008\.00000000 XID now and the rest in another send$"):
             w.plan_payment(coins(240, "14"), Decimal("3333"), feerate=RATE)
         with self.assertRaisesRegex(w.WalletError, "one transaction can carry at most 72"):
             w.select_coins(coins(240, "14"), Decimal("3333"), feerate=RATE)
     def test_split_insufficient(self):
-        with self.assertRaisesRegex(w.WalletError, r"insufficient spendable funds: have 3360\.00000000 XCF"):
+        with self.assertRaisesRegex(w.WalletError, r"insufficient spendable funds: have 3360\.00000000 XID"):
             w.plan_payment(coins(240, "14"), Decimal("3360"), feerate=RATE, split=True)
         with self.assertRaisesRegex(w.WalletError, "insufficient"):
             w.plan_payment(coins(10, "1"), Decimal("20"), feerate=RATE, split=True)
@@ -259,8 +259,8 @@ class TestSplitSendNode(SplitBase):
         rc, out, err, _ = self.send("send", T.DEST, "3333", "--split", "--yes", events=False)
         self.assertEqual(rc, 0, err)
         self.assertIn("Transaction preview (split into 4 transactions)", out)
-        self.assertIn("  Amount:      3333.00000000 XCF in total", out)
-        self.assertIn("  Tx 1/4:      72 inputs, pays 1007.99003090 XCF, fee 0.00996910 XCF", out)
+        self.assertIn("  Amount:      3333.00000000 XID in total", out)
+        self.assertIn("  Tx 1/4:      72 inputs, pays 1007.99003090 XID, fee 0.00996910 XID", out)
         self.assertIn("  Tx 4/4:      23 inputs", out)
         self.assertIn("Broadcast successful: 4 transactions", out)
     def test_without_split_unchanged_error_nothing_signed(self):
@@ -289,7 +289,7 @@ class TestSplitSendNode(SplitBase):
     def test_fee_guards(self):
         pool = coins(240, "14"); self.fake(pool)
         rc, _, err, _ = self.send("send", T.DEST, "3333", "--split", "--yes", "--max-fee", "0.03")
-        self.assertEqual(rc, 1); self.assertIn("total fee 0.03309850 XCF exceeds --max-fee", err)
+        self.assertEqual(rc, 1); self.assertIn("total fee 0.03309850 XID exceeds --max-fee", err)
         rc, _, err, _ = self.send("send", T.DEST, "3333", "--split", "--yes", "--fee", "0.01")
         self.assertEqual(rc, 1); self.assertIn("a split send needs a fee rate", err)
         self.assertEqual(self.signed, [])
