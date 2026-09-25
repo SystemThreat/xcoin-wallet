@@ -91,7 +91,7 @@ Global options: `--file <wallet>`, `--config <nex.conf>`, `--rpc-host/-port/-use
 | `signmessage --template T \| --message M [--index N] [--as identity\|address]` | Sign a message with the key at `--index` (FIPS 204 ML-DSA-65) for the MineDifferent sign-in; `{address}` in the template names the signer. |
 | `balance` / `status [--index N]` | Balance split into **spendable** vs **immature** (coinbase < 1,000 confs), over both address forms of the key; `--json` adds a per-form breakdown (`forms.two_leaf`, `forms.carried`). |
 | `utxos [--index N]` | Every UTXO with height, confirmations, maturity status and form (`two_leaf` / `carried`). |
-| `send <dest> <amount> [--index N] [--fee X \| --feerate R] [--max-fee X] [--yes] [--dry-run]` | Select coins from both forms, estimate fee, sign with ML-DSA, confirm, broadcast; change goes to the two-leaf address. |
+| `send <dest> <amount> [--index N] [--fee X \| --feerate R] [--max-fee X] [--split] [--yes] [--dry-run]` | Select coins from both forms, estimate fee, sign with ML-DSA, confirm, broadcast; change goes to the two-leaf address. `--split` pays an amount too large for one transaction as several. |
 | `history [--index N] [--from-height H]` | Full send/receive history (scans the chain; includes mempool). |
 | `info` | Chain, sync state, peers, mempool, and relay-fee status. |
 | `seed [--copy [--timeout S]] [--yes]` | Re-display the seed (type `REVEAL`) or copy it to the clipboard. |
@@ -189,10 +189,20 @@ plus this open-source tool could decode it.
   The rate comes from `estimatesmartfee`, else your `fallbackfee`, else the relay floor.
   Override with `--feerate` (XCF/kvB) or an absolute `--fee`.
 - `--max-fee` (default 0.1 XCF) refuses runaway fees.
-- Change below 0.00001 XCF is folded into the fee instead of creating dust.
+- Change below 0.0001 XCF (the 10,000-sat consensus output floor) is folded into the fee instead of creating dust.
 - Every transaction is checked with `testmempoolaccept` before broadcast — a spend the
   network would reject (e.g. immature coinbase) never leaves the wallet.
 - `--dry-run` signs, decodes, and policy-checks without broadcasting anything.
+- One transaction carries at most 72 ML-DSA inputs (the node's 400,000 WU standard
+  weight). A payment needing more fails with "split the send"; `--split` instead plans
+  it as several independent transactions (largest coins first, each paying the
+  destination, every output and change at least 10,000 sat), signs them all with one
+  unlock (one card tap), then broadcasts them in turn. If a later broadcast fails after
+  earlier ones went out, the send exits 0 with `"partial": true`, the `txids` that went
+  out, `unsent_txids` and `broadcast_error`. `--max-fee` then guards the total fee.
+  The first of `unsent_txids` is the one whose broadcast failed: a lost connection can
+  hide its success, so look it up before paying the rest again (the others were never
+  tried). A failed first broadcast exits 1 and names that txid the same way.
 
 ### Offline signing (seed never touches the node)
 
@@ -339,6 +349,8 @@ nothing persists. They exist only to run the wallet headless/scripted.
 |---|---|---|
 | `XCOIN_RPC_USER` / `XCOIN_RPC_PASSWORD` | **secret** | Node RPC login, used only if not passed via `--rpc-user/--rpc-password` or found in `nex.conf`. Keeps the RPC password off the command line (where `ps` would show it). This is the *node's* password, not your seed. |
 | `HOME` | config | Locates `~/.xcoin/`. Standard; set by your shell. |
+| `XCOIN_CARD_TIMEOUT` | config | Seconds to wait for a card tap (default 60, 5..300). The wait watches the reader's PICC interface with `SCardGetStatusChange` and connects once the card is there. |
+| `XCOIN_EVENTS` | config | `1`: machine-readable progress on stderr for a parent program (MMM): `XCOIN-EVENT card-wait <s>` before every card tap (unlock, `new --card`, `card-backup`, `card-test`, `card-reset`) and `card-ok` after it succeeds; `signing <i> <n>`; `broadcast-begin <n>` just before the first broadcast (from here the parent must not stop the CLI; a 0.5 s pause follows so a cancel already on its way lands before anything is sent; if the parent quits or dies, the CLI still attempts every broadcast: SIGPIPE is ignored and output to a closed pipe is dropped); `broadcast <i> <n> <txid>` per accepted transaction; `done`. |
 | `NEX` | config | `build.sh` only — path to the Xcoin source tree (to find the PQClean sources). |
 | `PREFIX` | config | `install.sh` only — install prefix for the CLI symlinks (default `~/.local`). |
 

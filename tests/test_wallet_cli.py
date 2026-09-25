@@ -998,7 +998,7 @@ class TestMmm5Format(DexFormatBase):
             taps.append(store.load(UID))                      # the real Mmm5CardStore
             return FakeFactor(factor), taps[-1]
         fake = types.SimpleNamespace(
-            disable_core_dumps=lambda: None,
+            disable_core_dumps=lambda: None, card_timeout=lambda: 60,
             PCSCTransport=lambda: types.SimpleNamespace(close=lambda: None),
             read_factor=read_factor,
             family_of=lambda b: hashlib.sha256(b"xcoin-mmm-family" + b).hexdigest()[:16])
@@ -1016,6 +1016,23 @@ class TestMmm5Format(DexFormatBase):
         self.assertEqual(len(taps), 1)
         self.assertEqual(taps[0]["uid"], UID)
         self.assertIn("Tap your wallet card", err.getvalue())  # prompt on stderr, stdout stays JSON-clean
+    def test_unlock_events(self):
+        from contextlib import redirect_stderr
+        p, _ = self.make_wallet()
+        self.patch_card(FACTOR)
+        self.use_passphrase("pw123"); self.no_prompt()
+        self.addCleanup(os.environ.pop, "XCOIN_EVENTS", None)
+        for value, want in (("1", ["XCOIN-EVENT card-wait 60", "XCOIN-EVENT card-ok"]), (None, [])):
+            os.environ.pop("XCOIN_EVENTS", None)
+            if value: os.environ["XCOIN_EVENTS"] = value
+            err = io.StringIO()
+            with redirect_stderr(err): self.assertEqual(w.read_seed(p), SEED)
+            self.assertEqual([l for l in err.getvalue().splitlines() if l.startswith("XCOIN-EVENT")], want)
+        # the passphrase is checked before the card is waited for: a wrong one never announces a wait
+        os.environ["XCOIN_EVENTS"] = "1"; self.use_passphrase("nope")
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaisesRegex(w.WalletError, "wrong passphrase"): w.read_seed(p)
+        self.assertNotIn("XCOIN-EVENT", err.getvalue())
     def test_wrong_passphrase_fails_before_any_tap(self):
         p, _ = self.make_wallet()
         taps = self.patch_card(FACTOR)

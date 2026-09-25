@@ -12,7 +12,7 @@ fallback leaf 0xc2}; the single-leaf tree {ML-DSA-65 leaf} of the same key (the
 counted and spent. Derivation and signing live in the native keytool.
 """
 
-import argparse, base64, getpass, hashlib, hmac, json, os, shutil, subprocess, sys, time, urllib.request, urllib.error
+import argparse, base64, contextlib, getpass, hashlib, hmac, json, os, shutil, signal, subprocess, sys, time, urllib.request, urllib.error
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 
@@ -62,7 +62,38 @@ def jdefault(o):
     if isinstance(o, Decimal): return fmt8(o)
     raise TypeError(f"not JSON serializable: {type(o)}")
 
-def emit_json(data): print(json.dumps(data, indent=2, default=jdefault))
+COMMITTED = False   # set once broadcast-begin reached the parent; before that a dead parent must stop the run
+
+def say(text="", stream=None):
+    """print + flush. Before the send is committed a closed pipe raises as usual, so a CLI whose
+    parent (MMM) died before broadcast-begin stops with nothing sent. Once committed the text is
+    dropped and the stream pointed at /dev/null, so an orphan finishes every broadcast and exits cleanly."""
+    stream = stream or sys.stdout
+    try: print(text, file=stream, flush=True)
+    except OSError:
+        if not COMMITTED: raise
+        with contextlib.suppress(OSError, ValueError):
+            fd = os.open(os.devnull, os.O_WRONLY); os.dup2(fd, stream.fileno()); os.close(fd)
+
+def emit_json(data): say(json.dumps(data, indent=2, default=jdefault))
+
+def event(*parts):
+    """`XCOIN-EVENT <parts>` progress line on stderr for a parent program (MMM); only under XCOIN_EVENTS=1."""
+    if os.getenv("XCOIN_EVENTS") == "1": say("XCOIN-EVENT " + " ".join(map(str, parts)), sys.stderr)
+
+BROADCAST_GRACE = 0.5   # seconds between broadcast-begin and the first send (events on only)
+
+def broadcast_begin(n):
+    """Just before the first send. From here only a broadcast's own failure stops the loop:
+    SIGPIPE is ignored and output goes through say(), so an orphaned CLI finishes every
+    broadcast. XCOIN-EVENT broadcast-begin <n> stops the parent offering cancel; one it sent
+    before reading the line lands in the pause, while nothing has gone out yet."""
+    global COMMITTED
+    if os.getenv("XCOIN_EVENTS") == "1":
+        event("broadcast-begin", n)   # strict write: a parent already gone means nobody records the send, so send nothing
+    COMMITTED = True
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    if os.getenv("XCOIN_EVENTS") == "1": time.sleep(BROADCAST_GRACE)
 
 # --- .mmm wallet file format ---------------------------------------------
 # magic(10) | salt(16) | nonce(16) | ciphertext(32-64) | hmac-sha256(32)
@@ -333,6 +364,22 @@ def card_passphrase(required=False):
     if required and not pw: raise WalletError("a card wallet needs its passphrase")
     return pw
 
+@contextlib.contextmanager
+def card_reader(cs):
+    """A transport for ONE NFC wait, announced as XCOIN-EVENT card-wait <budget>;
+    every card flow opens its waits here (the caller emits card-ok on success)."""
+    transport = cs.PCSCTransport()
+    try:
+        event("card-wait", cs.card_timeout())
+        yield transport
+    finally:
+        transport.close()
+
+def tap_factor(cs, store=None):
+    """The one card wait of an unlock."""
+    with card_reader(cs) as transport:
+        return cs.read_factor(transport, store)
+
 def read_seed_card(blob):
     """Unlock a card-bound wallet: tap the matching card, read its factor over
     an authenticated+encrypted channel, derive the wallet key. The factor and
@@ -340,17 +387,14 @@ def read_seed_card(blob):
     cs = _card_module()
     cs.disable_core_dumps()
     want_family = mmm2_family(blob)
-    transport = cs.PCSCTransport()
-    try:
-        factor, auth = cs.read_factor(transport)
-    finally:
-        transport.close()
+    factor, auth = tap_factor(cs)
     try:
         if cs.family_of(factor.bytes()) != want_family:
             raise WalletError("this card does not belong to this wallet (family mismatch)")
         pw = card_passphrase()
         seed = mmm2_decode(blob, factor.bytes(), pw)
         if not _valid_seed(seed): raise WalletError("decryption produced an invalid seed")
+        event("card-ok")
         return seed.lower()
     finally:
         factor.close()
@@ -363,16 +407,13 @@ def read_seed_mmm5(path, blob):
     pw = card_passphrase(required=True)
     store = Mmm5CardStore(path, pw)                       # wrong passphrase fails here, before any tap
     print("Tap your wallet card on the reader…", file=sys.stderr)
-    transport = cs.PCSCTransport()
-    try:
-        factor, _auth = cs.read_factor(transport, store)
-    finally:
-        transport.close()
+    factor, _auth = tap_factor(cs, store)
     try:
         if cs.family_of(factor.bytes()) != store.family:
             raise WalletError("this card does not belong to this wallet (family mismatch)")
         seed = mmm5_seed(blob, factor.bytes(), pw)
         if not _valid_seed(seed): raise WalletError("decryption produced an invalid seed")
+        event("card-ok")
         return seed.lower()
     finally:
         factor.close()
@@ -864,29 +905,55 @@ def resolve_feerate(rpc, args):
     if fallback: return max(money(fallback, "fallbackfee"), floor), "fallbackfee"
     return max(floor * 10, floor), "relay floor x10"
 
-def select_coins(mature, amount, feerate=None, fixed_fee=None):
-    """Largest-first selection (fewer huge PQ inputs = smaller tx = lower fee).
+def max_inputs():
+    """Most inputs one transaction can carry within MAX_STANDARD_TX_WEIGHT (2 outputs budgeted)."""
+    n = 0
+    while estimate_sizes(n + 1, 2)[1] * 4 <= MAX_STANDARD_TX_WEIGHT: n += 1
+    return n
 
-    Returns (selected, fee, change). With feerate the fee grows as inputs are
-    added; sub-dust change is folded into the fee either way.
-    """
-    selected, total = [], Decimal(0)
-    for u in sorted(mature, key=lambda x: x["amount"], reverse=True):
-        if estimate_sizes(len(selected) + 1, 2)[1] * 4 > MAX_STANDARD_TX_WEIGHT:
-            have = sum((x["amount"] for x in mature), Decimal(0))
-            if have >= amount:
+def plan_payment(mature, amount, feerate=None, fixed_fee=None, split=False):
+    """Largest-first selection (fewer huge PQ inputs = smaller tx = lower fee), as
+    a list of independent transactions [(selected, pay, fee, change)] paying
+    `amount` in total. Each carries at most max_inputs() inputs; one that cannot
+    finish the payment spends them all to the destination and the next carries
+    on (only with `split`: otherwise that is the "split the send" error). Every
+    payment and change is >= DUST_CHANGE: sub-dust change of the last transaction
+    is folded into its fee, and an earlier one that would leave a sub-dust rest
+    keeps DUST_CHANGE as change instead. Fees budget 2 outputs per transaction."""
+    coins = sorted(mature, key=lambda x: x["amount"], reverse=True)
+    cap, plan, left, pos = max_inputs(), [], amount, 0
+    def short(selected, total, fee):
+        have = sum((u["amount"] for u in coins[:pos + len(selected)]), Decimal(0))
+        return WalletError(f"insufficient spendable funds: have {fmt(have)}, need about {fmt(have - total + left + fee)}")
+    while True:
+        selected, total, fee = [], Decimal(0), fixed_fee
+        for u in coins[pos:pos + cap]:
+            selected.append(u); total += u["amount"]
+            fee = fixed_fee if fixed_fee is not None else fee_for(len(selected), 2, feerate)
+            if total >= left + fee:
+                change = money(total - left - fee)
+                if 0 < change < DUST_CHANGE:
+                    fee = money(fee + change); change = Decimal(0)
+                plan.append((selected, money(left), money(fee), change)); return plan
+        if fee is None: fee = fee_for(1, 2, feerate)
+        if len(selected) < cap or pos + cap >= len(coins): raise short(selected, total, fee)
+        if not split:
+            if sum((x["amount"] for x in mature), Decimal(0)) >= amount:
                 raise WalletError(f"one transaction can carry at most {len(selected)} inputs ({fmt(total)} from these UTXOs); "
                                   f"send at most about {fmt(total)} now and the rest in another send")
-            break
-        selected.append(u); total += u["amount"]
-        fee = fixed_fee if fixed_fee is not None else fee_for(len(selected), 2, feerate)
-        if total >= amount + fee:
-            change = money(total - amount - fee)
-            if 0 < change < DUST_CHANGE:
-                fee = money(fee + change); change = Decimal(0)
-            return selected, money(fee), change
-    fee = fixed_fee if fixed_fee is not None else fee_for(max(len(selected), 1), 2, feerate)
-    raise WalletError(f"insufficient spendable funds: have {fmt(total)}, need about {fmt(amount + fee)}")
+            raise short(selected, total, fee)
+        if fixed_fee is not None:
+            raise WalletError("--fee fixes one transaction's fee; a split send needs a fee rate (--feerate, or neither)")
+        pay, change = money(total - fee), Decimal(0)
+        if left - pay < DUST_CHANGE: pay, change = money(pay - DUST_CHANGE), DUST_CHANGE
+        if pay < DUST_CHANGE: raise short(selected, total, fee)
+        plan.append((selected, pay, money(fee), change))
+        left -= pay; pos += cap
+
+def select_coins(mature, amount, feerate=None, fixed_fee=None):
+    """One-transaction selection: (selected, fee, change); see plan_payment."""
+    (selected, _pay, fee, change), = plan_payment(mature, amount, feerate, fixed_fee)
+    return selected, fee, change
 
 def wallet_scan(args):
     """Derive key --index and scan BOTH of its scripts (two-leaf + carried) in one call."""
@@ -970,11 +1037,9 @@ def cmd_new_card(args, p):
     try:
         family = cs.family_of(factor.bytes())
         print("Provisioning the PRIMARY card — tap and hold it on the reader.", file=sys.stderr)
-        transport = cs.PCSCTransport()
-        try:
+        with card_reader(cs) as transport:
             record = cs.provision_card(transport, factor, family, label=args.label or "primary")
-        finally:
-            transport.close()
+        event("card-ok")
         auth_file = cs.auth_path(record["uid"])   # provision_card already saved it (crash-safe)
         pw = new_passphrase(args)   # optional second factor
         blob = mmm2_encode(seedbuf.hex(), factor.bytes(), family, pw)
@@ -1012,18 +1077,16 @@ def cmd_card_backup(args):
         raise WalletError("this is a dex-wallet-era card wallet (read-only here); make backup cards with dex-wallet-cli")
     want_family = mmm2_family(p.read_bytes())
     print("Step 1/2 — tap an EXISTING card for this wallet (to copy its key).", file=sys.stderr)
-    t1 = cs.PCSCTransport()
-    try: factor, _auth = cs.read_factor(t1)
-    finally: t1.close()
+    with card_reader(cs) as t1:
+        factor, _auth = cs.read_factor(t1)
     try:
         if cs.family_of(factor.bytes()) != want_family:
             raise WalletError("that card does not belong to this wallet")
+        event("card-ok")
         input("Step 2/2 — remove it, place a FACTORY card, then press Enter... ")
-        t2 = cs.PCSCTransport()
-        try:
+        with card_reader(cs) as t2:
             record = cs.provision_card(t2, factor, want_family, label=args.label or "backup")
-        finally:
-            t2.close()
+        event("card-ok")
         auth_file = cs.auth_path(record["uid"])
         permanent = not args.resettable
         if permanent:
@@ -1041,9 +1104,9 @@ def cmd_card_test(args):
     """Read-only proof that a provisioned card authenticates and yields a factor.
     Does not touch any wallet file; safe to run anytime."""
     cs = _card_module(); cs.disable_core_dumps()
-    t = cs.PCSCTransport()
-    try: factor, auth = cs.read_factor(t)
-    finally: t.close()
+    with card_reader(cs) as t:
+        factor, auth = cs.read_factor(t)
+    event("card-ok")
     try:
         fam = cs.family_of(factor.bytes())
     finally:
@@ -1057,9 +1120,9 @@ def cmd_card_reset(args):
     auth file. Guarded: refuses unless --yes. Never touches a wallet file."""
     cs = _card_module(); cs.disable_core_dumps()
     if not args.yes: raise WalletError("card-reset erases the card; pass --yes to confirm")
-    t = cs.PCSCTransport()
-    try: uid = cs.factory_reset_card(t)
-    finally: t.close()
+    with card_reader(cs) as t:
+        uid = cs.factory_reset_card(t)
+    event("card-ok")
     auth = cs.auth_path(uid)
     moved = None
     if auth.exists():
@@ -1252,87 +1315,136 @@ def cmd_send(args):
     max_fee = money(args.max_fee, "max-fee")
     mature, immature = classify_utxos(result)
 
+    split = getattr(args, "split", False)
     try:
         if args.fee is not None:
             fixed = money(args.fee, "fee")
             if fixed < 0: raise WalletError("fee must be non-negative")
-            selected, fee, change = select_coins(mature, amount, fixed_fee=fixed)
-            fee_desc = f"{fmt(fee)} (fixed via --fee)"
+            plan = plan_payment(mature, amount, fixed_fee=fixed, split=split)
+            rate_desc = "fixed via --fee"
         else:
             feerate, source = resolve_feerate(rpc, args)
-            selected, fee, change = select_coins(mature, amount, feerate=feerate)
-            fee_desc = f"{fmt(fee)} ({fmt8(feerate)}/kvB via {source})"
+            plan = plan_payment(mature, amount, feerate=feerate, split=split)
+            rate_desc = f"{fmt8(feerate)}/kvB via {source}"
     except WalletError as e:
         if immature and "insufficient" in str(e):
             raise WalletError(f"{e}; note: {maturity_note(immature)}")
         raise
-    if fee > max_fee:
-        raise WalletError(f"fee {fmt(fee)} exceeds --max-fee {fmt(max_fee)}; pass a higher --max-fee to allow it")
+    n = len(plan)
+    fee, change = money(sum(t[2] for t in plan)), money(sum(t[3] for t in plan))
+    if fee > max_fee:   # a split send is guarded on its total
+        raise WalletError(f"{'total fee' if n > 1 else 'fee'} {fmt(fee)} exceeds --max-fee {fmt(max_fee)}; pass a higher --max-fee to allow it")
 
-    est_total, est_vsize = estimate_sizes(len(selected), 2 if change > 0 else 1)
+    selected = [u for t in plan for u in t[0]]
+    sizes = [estimate_sizes(len(s), 2 if c > 0 else 1) for s, _, _, c in plan]
+    est_total, est_vsize = sum(b for b, _ in sizes), sum(v for _, v in sizes)
     n_carried = sum(1 for u in selected if u["kind"] == "carried")
+    many = " in total" if n > 1 else ""
     if not args.json:
-        print("Transaction preview")
+        print("Transaction preview" + (f" (split into {n} transactions)" if n > 1 else ""))
         print(f"  Chain:       {chain}")
         print(f"  From:        {own['address']} (index {args.index})" + (" + its carried single-leaf form" if n_carried else ""))
         print(f"  To:          {args.destination}")
-        print(f"  Amount:      {fmt(amount)}")
-        print(f"  Fee:         {fee_desc}")
+        print(f"  Amount:      {fmt(amount)}{many}")
+        print(f"  Fee:         {fmt(fee)}{many} ({rate_desc})")
         print(f"  Change:      {fmt(change)}")
         print(f"  Inputs:      {len(selected)}" + (f" ({n_carried} carried)" if n_carried else "") + f"  (~{est_total} bytes, ~{est_vsize} vbytes signed)")
-        print("  Signing:     OFFLINE keytool (seed stays here)")
+        for i, (s, pay, f, c) in enumerate(plan if n > 1 else [], 1):
+            print(f"  Tx {i}/{n}:".ljust(15) + f"{len(s)} inputs, pays {fmt(pay)}, fee {fmt(f)}" + (f", change {fmt(c)}" if c > 0 else ""))
+        print("  Signing:     OFFLINE keytool (seed stays here)" + ("; all signed before the first broadcast" if n > 1 else ""))
         if immature: print(f"  Excluded:    {maturity_note(immature)}")
     if not args.yes:
         if args.json: raise WalletError("--json send requires --yes (no interactive prompt in JSON mode)")
-        answer = input("Type SEND to sign" + (" (dry run)" if args.dry_run else " and broadcast") + ": ").strip()
+        answer = input("Type SEND to sign" + (f" all {n} transactions" if n > 1 else "") + (" (dry run)" if args.dry_run else " and broadcast") + ": ").strip()
         if answer != "SEND": raise WalletError("cancelled")
 
-    outputs = [{args.destination: fmt8(amount)}]
-    if change > 0: outputs.append({own["address"]: fmt8(change)})   # change always to the two-leaf address
-    raw = rpc.call("createrawtransaction", [[{"txid": u["txid"], "vout": u["vout"]} for u in selected], outputs])
-    # Each prevout carries its own script (two-leaf or carried); the keytool matches it
-    # against the key's two trees and signs the ML-DSA leaf with the right control block.
-    prev = [{"txid": u["txid"], "vout": u["vout"], "scriptPubKey": u["scriptPubKey"],
-             "amount": u["amount"], "keyindex": args.index} for u in selected]
+    # The seed was unlocked once (one card tap) by wallet_scan; every transaction is
+    # signed with it before the first broadcast.
+    txs = []
+    for i, (sel, pay, f, c) in enumerate(plan, 1):
+        outputs = [{args.destination: fmt8(pay)}]
+        if c > 0: outputs.append({own["address"]: fmt8(c)})   # change always to the two-leaf address
+        raw = rpc.call("createrawtransaction", [[{"txid": u["txid"], "vout": u["vout"]} for u in sel], outputs])
+        # Each prevout carries its own script (two-leaf or carried); the keytool matches it
+        # against the key's two trees and signs the ML-DSA leaf with the right control block.
+        prev = [{"txid": u["txid"], "vout": u["vout"], "scriptPubKey": u["scriptPubKey"],
+                 "amount": u["amount"], "keyindex": args.index} for u in sel]
+        # Sign OFFLINE in the native keytool: the seed never reaches the node.
+        event("signing", i, n)
+        txs.append({"hex": sign_offline(seed, raw, prev), "pay": pay, "fee": f, "change": c, "inputs": len(sel),
+                    "carried_inputs": sum(1 for u in sel if u["kind"] == "carried")})
+    signer = "offline keytool"
 
-    # Sign OFFLINE in the native keytool: the seed never reaches the node.
-    signed_hex = sign_offline(seed, raw, prev); signer = "offline keytool"
+    for t in txs:
+        if getattr(rpc, "is_explorer", False):
+            # No local node: txid/vsize computed here; the explorer's broadcast
+            # endpoint runs testmempoolaccept itself before relaying.
+            local = parse_signed_tx(t["hex"])
+            t.update(txid=local["txid"], size=local["size"], vsize=local["vsize"], mempool_accept=None)
+        else:
+            # one per call: two near-cap transactions exceed the node's package weight limit
+            verdict = (rpc.call("testmempoolaccept", [[t["hex"]]]) or [{}])[0]
+            decoded = rpc.call("decoderawtransaction", [t["hex"]])
+            t.update(txid=decoded.get("txid"), size=len(t["hex"]) // 2, vsize=decoded.get("vsize"),
+                     mempool_accept=bool(verdict.get("allowed")))
+            if not verdict.get("allowed"): t["reject_reason"] = verdict.get("reject-reason", "unknown")
+    bad = [(i, t) for i, t in enumerate(txs, 1) if t["mempool_accept"] is False]
+    if bad and not args.dry_run:
+        i, t = bad[0]
+        raise WalletError(f"node would reject {'this transaction' if n == 1 else f'transaction {i} of {n}'} "
+                          f"({t['reject_reason']}); nothing was broadcast")
 
-    if getattr(rpc, "is_explorer", False):
-        # No local node: txid/vsize computed here; the explorer's broadcast
-        # endpoint runs testmempoolaccept itself before relaying.
-        local = parse_signed_tx(signed_hex)
-        data = {"txid": local["txid"], "size": local["size"], "vsize": local["vsize"],
-                "fee": fee, "change": change, "signer": signer, "inputs": len(selected),
-                "carried_inputs": n_carried, "mempool_accept": None, "broadcast": False}
-        if args.dry_run:
-            if args.json: emit_json(data); return
-            print(f"Dry run: signed OK, NOT broadcast.\nTXID: {data['txid']}\nSigned bytes: {data['size']} ({data['vsize']} vbytes)")
-            print("Mempool check: performed by the explorer at broadcast")
-            return
+    sent, error = [], None
+    if not args.dry_run: broadcast_begin(n)
+    for i, t in enumerate([] if args.dry_run else txs, 1):
+        try: t["txid"] = rpc.call("sendrawtransaction", [t["hex"]])
+        except Exception as e:
+            if not sent:        # a lost connection can hide a success: name what to look up
+                raise WalletError(f"{e}. Nothing is confirmed sent, but if the connection dropped it may have gone out: "
+                                  f"look up {t['txid']} before sending again"
+                                  + (f" (the other {n - 1} transactions were never broadcast)" if n > 1 else "")) from e
+            error = e; break    # earlier ones are out (independent coins): report exactly those
+        sent.append(t); event("broadcast", i, n, t["txid"])
+
+    shown = txs if args.dry_run else sent
+    if not split:
+        t = txs[0]
+        data = {"txid": t["txid"], "size": t["size"], "vsize": t["vsize"], "fee": fee, "change": change, "signer": signer,
+                "inputs": t["inputs"], "carried_inputs": t["carried_inputs"], "mempool_accept": t["mempool_accept"], "broadcast": bool(sent)}
+        if "reject_reason" in t: data["reject_reason"] = t["reject_reason"]
     else:
-        accept = rpc.call("testmempoolaccept", [[signed_hex]])
-        verdict = accept[0] if accept else {}
-        decoded = rpc.call("decoderawtransaction", [signed_hex])
-        data = {"txid": decoded.get("txid"), "size": len(signed_hex) // 2,
-                "vsize": decoded.get("vsize"), "fee": fee, "change": change, "signer": signer,
-                "inputs": len(selected), "carried_inputs": n_carried,
-                "mempool_accept": bool(verdict.get("allowed")), "broadcast": False}
-        if not verdict.get("allowed"):
-            data["reject_reason"] = verdict.get("reject-reason", "unknown")
-
-        if args.dry_run:
-            if args.json: emit_json(data); return
-            print(f"Dry run: signed OK, NOT broadcast.\nTXID: {data['txid']}\nSigned bytes: {data['size']} ({data['vsize']} vbytes)")
-            if data["mempool_accept"]: print("Mempool check: would be accepted")
-            else: print(f"Mempool check: would be REJECTED ({data['reject_reason']})")
-            return
-        if not data["mempool_accept"]:
-            raise WalletError(f"node would reject this transaction ({data['reject_reason']}); nothing was broadcast")
-    txid = rpc.call("sendrawtransaction", [signed_hex])
-    data.update(txid=txid, broadcast=True)
-    if args.json: emit_json(data); return
-    print(f"Broadcast successful\nTXID: {txid}")
+        # totals cover exactly the listed txids: all of them, or the ones a partial send got out
+        data = {"broadcast": bool(sent), "txid": shown[0]["txid"], "txids": [t["txid"] for t in shown], "transactions": n,
+                "amount": money(sum(t["pay"] for t in shown)), "fee": money(sum(t["fee"] for t in shown)),
+                "vsize": sum(t["vsize"] or 0 for t in shown), "change": money(sum(t["change"] for t in shown)),
+                "inputs": sum(t["inputs"] for t in shown), "carried_inputs": sum(t["carried_inputs"] for t in shown),
+                "signer": signer, "partial": error is not None, "size": sum(t["size"] for t in shown),
+                "mempool_accept": None if txs[0]["mempool_accept"] is None else not bad}
+        if bad: data["reject_reason"] = bad[0][1]["reject_reason"] if n == 1 else "; ".join(f"transaction {i}: {t['reject_reason']}" for i, t in bad)
+        if error is not None:   # a lost connection can hide a success: name what to look up
+            data.update(broadcast_error=str(error), unsent_txids=[t["txid"] for t in txs[len(sent):]])
+    if args.json: emit_json(data)
+    elif n == 1:
+        t = txs[0]
+        if not args.dry_run: say(f"Broadcast successful\nTXID: {t['txid']}")
+        else:
+            say(f"Dry run: signed OK, NOT broadcast.\nTXID: {t['txid']}\nSigned bytes: {t['size']} ({t['vsize']} vbytes)")
+            say("Mempool check: performed by the explorer at broadcast" if t["mempool_accept"] is None else
+                "Mempool check: would be accepted" if t["mempool_accept"] else f"Mempool check: would be REJECTED ({t['reject_reason']})")
+    else:
+        say(f"Dry run: {n} transactions signed OK, NOT broadcast." if args.dry_run else
+            f"Broadcast successful: {n} transactions" if error is None else
+            f"PARTIAL SEND: {len(sent)} of {n} transactions broadcast; transaction {len(sent) + 1} failed: {error}")
+        for i, t in enumerate(txs, 1):
+            # the one that failed is UNKNOWN (a lost connection can hide a success); later ones were never tried
+            check = (("" if i <= len(sent) else "  UNKNOWN: look it up" if i == len(sent) + 1 else "  NOT SENT") if not args.dry_run else
+                     "  (mempool check at broadcast)" if t["mempool_accept"] is None else
+                     "  (would be accepted)" if t["mempool_accept"] else f"  (would be REJECTED: {t['reject_reason']})")
+            say(f"  {i}/{n}  TXID: {t['txid']}  pays {fmt(t['pay'])}, fee {fmt(t['fee'])}, {t['vsize']} vbytes{check}")
+        if error is not None:
+            say(f"Paid {fmt(data['amount'])} of {fmt(amount)}. Look up {txs[len(sent)]['txid']} before paying the rest again: "
+                "if the connection dropped it may have gone out." + (" The NOT SENT transactions were never broadcast." if len(sent) + 1 < n else ""))
+    event("done")
 
 def cmd_history(args):
     rpc, seed = make_backend(args), require_seed(args)
@@ -1555,7 +1667,9 @@ def parser():
     q.add_argument("destination"); q.add_argument("amount")
     q.add_argument("--fee", help="absolute fee in XCF (overrides --feerate)")
     q.add_argument("--feerate", help="fee rate in XCF/kvB (default: auto)")
-    q.add_argument("--max-fee", default=str(DEFAULT_MAX_FEE), help=f"refuse fees above this (default {DEFAULT_MAX_FEE} XCF)")
+    q.add_argument("--max-fee", default=str(DEFAULT_MAX_FEE), help=f"refuse fees above this (default {DEFAULT_MAX_FEE} XCF; with --split, the total)")
+    q.add_argument("--split", action="store_true", help="pay an amount too large for one standard transaction as several independent ones, "
+                   "all signed with one unlock (one card tap), then broadcast in turn")
     q.add_argument("--index", type=int, default=0); q.add_argument("--yes", action="store_true"); q.add_argument("--dry-run", action="store_true")
     q.set_defaults(fn=cmd_send)
     q = sub.add_parser("history", help="transaction history (scans the chain)")
@@ -1605,15 +1719,15 @@ def main(argv=None):
             read_passphrase_fd(args.passphrase_fd)
         args.fn(args)
     except KeyboardInterrupt:
-        print("cancelled", file=sys.stderr); return 130
+        say("cancelled", sys.stderr); return 130
     except WalletError as e:
-        print(f"error: {e}", file=sys.stderr); return 1
+        say(f"error: {e}", sys.stderr); return 1
     except Exception as e:
         # card_seed.CardError (lazily imported) and other card/hardware faults
         try: from card_seed import CardError
         except Exception: CardError = ()
         if CardError and isinstance(e, CardError):
-            print(f"error: {e}", file=sys.stderr); return 1
+            say(f"error: {e}", sys.stderr); return 1
         raise
     return 0
 

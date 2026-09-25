@@ -134,32 +134,62 @@ def _unpad80(data):
 
 # --- transport ---------------------------------------------------------------
 
+CARD_TIMEOUT = 60           # seconds to wait for a tap; XCOIN_CARD_TIMEOUT overrides (5..300)
+
+def card_timeout():
+    try: return max(5, min(300, int(os.environ["XCOIN_CARD_TIMEOUT"])))
+    except (KeyError, ValueError): return CARD_TIMEOUT
+
 class PCSCTransport:
     """Thin PC/SC wrapper (ACR1252 or any PC/SC reader)."""
     def __init__(self):
         try:
             from smartcard.System import readers
             from smartcard.Exceptions import NoCardException
+            from smartcard import scard
         except ImportError:
             raise CardError("pyscard not installed (pip3 install pyscard)")
-        self._readers, self._NoCard = readers, NoCardException
+        self._readers, self._NoCard, self._scard = readers, NoCardException, scard
         self.conn = None
-    def wait_for_card(self, timeout=60, prompt=True):
+    def wait_for_card(self, timeout=None, prompt=True):
+        """Wait for presence with SCardGetStatusChange, then SCardConnect once per
+        arrival. Never poll with SCardConnect: one that hung mid-poll wedged the
+        reader for every later process."""
+        timeout = card_timeout() if timeout is None else timeout
         rs = self._readers()
         if not rs: raise CardError("no PC/SC reader found — plug in the ACR1252")
-        # ACR1252 exposes two contactless interfaces; poll ALL of them each round.
-        cand = [r for r in rs if "ACR" in str(r) or "ACS" in str(r)] or list(rs)
+        # the ACR1252's contactless interface is its PICC one (its SAM slot never holds the card)
+        cand = {str(r): r for r in rs if "PICC" in str(r).upper()} or {str(r): r for r in rs}
         if prompt: print(f"Tap and hold the card on the reader ({len(cand)} interface(s))...", file=sys.stderr)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            for reader in cand:
-                try:
-                    conn = reader.createConnection(); conn.connect()
-                    self.conn = conn; return
-                except Exception:
-                    continue
-            time.sleep(0.3)
-        raise CardError("no card presented in time")
+        sc = self._scard
+        hr, ctx = sc.SCardEstablishContext(sc.SCARD_SCOPE_USER)
+        if hr != sc.SCARD_S_SUCCESS: raise CardError(f"PC/SC unavailable: {sc.SCardGetErrorMessage(hr)}")
+        try:
+            states, tried, failed = [(n, sc.SCARD_STATE_UNAWARE) for n in cand], set(), None
+            deadline = time.monotonic() + timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise CardError("no card presented in time" + (f" (last connect failed: {failed})" if failed else ""))
+                # 1 s slices keep Ctrl-C live; handing back the last state is what makes each call block
+                hr, got = sc.SCardGetStatusChange(ctx, max(1, int(min(left, 1.0) * 1000)), states)
+                if hr not in (sc.SCARD_S_SUCCESS, sc.SCARD_E_TIMEOUT):
+                    raise CardError(f"card reader wait failed: {sc.SCardGetErrorMessage(hr)}")
+                if hr == sc.SCARD_S_SUCCESS:
+                    if all(ev & sc.SCARD_STATE_UNKNOWN for _, ev, _ in got): raise CardError("the card reader went away")
+                    for name, ev, _atr in got:
+                        if not ev & sc.SCARD_STATE_PRESENT: tried.discard(name); continue
+                        if name in tried or ev & (sc.SCARD_STATE_MUTE | sc.SCARD_STATE_EXCLUSIVE): continue
+                        tried.add(name)
+                        conn = cand[name].createConnection()
+                        try: conn.connect()
+                        except Exception as e:       # left the field mid-tap: wait for the next arrival
+                            failed = e; continue
+                        self.conn = conn; return
+                    states = [(n, ev & ~sc.SCARD_STATE_CHANGED) for n, ev, _ in got]
+                time.sleep(0.05)                     # a driver that returns at once must not spin
+        finally:
+            sc.SCardReleaseContext(ctx)
     def transmit(self, apdu):
         resp, sw1, sw2 = self.conn.transmit(list(apdu))
         return bytes(resp), sw1, sw2
@@ -395,7 +425,7 @@ class SimNTAG424:
 
 class SimTransport:
     def __init__(self, card): self.card = card
-    def wait_for_card(self, timeout=30, prompt=True): pass
+    def wait_for_card(self, timeout=None, prompt=True): pass
     def transmit(self, apdu): return tuple(self.card.transmit(apdu)) if False else self._t(apdu)
     def _t(self, apdu):
         resp, sw1, sw2 = self.card.transmit(apdu)
