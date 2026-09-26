@@ -386,16 +386,16 @@ def child_seed(seed_hex, index):
     master = hashlib.shake_256(bytes.fromhex(seed_hex) + PQ_MASTER_DOMAIN).digest(32)
     return hashlib.shake_256(master + index_bytes(index) + PQ_CHILD_DOMAIN).digest(32)
 
-MAX_INDEX = (1 << 512) - 1
+MAX_INDEX = (1 << 2048) - 1
 
 def index_bytes(index):
     """The index as the derivation hashes it: below 2**32 the 4-byte little-endian form every
     xCoin wallet uses (src/pqhd.h), so existing addresses never change; from 2**32 up to
-    2**512-1 a 64-byte little-endian form (CernBank extended range). The lengths differ, so
-    the two can never collide."""
+    2**2048-1 a 256-byte little-endian form (CernBank extended range). The lengths differ,
+    so the two can never collide."""
     if not 0 <= index <= MAX_INDEX:
-        raise ValueError("index out of range (0 .. 2**512-1)")
-    return index.to_bytes(4, "little") if index < (1 << 32) else index.to_bytes(64, "little")
+        raise ValueError("index out of range (0 .. 2**2048-1)")
+    return index.to_bytes(4, "little") if index < (1 << 32) else index.to_bytes(256, "little")
 
 def parse_index(text):
     """An index as typed: decimal, or hexadecimal with a 0x prefix."""
