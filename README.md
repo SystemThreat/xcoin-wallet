@@ -77,6 +77,12 @@ xcoin-wallet address
 For maximum (air-gap) security, run steps 2–4 on a Mac that never goes back online and
 carry only the address (never the seed) to your online machine.
 
+**Never see the seed at all.** `xcoin-wallet new --offline --no-reveal` creates the same
+encrypted `.mmm` but prints only the file and address: the file is the backup, so copy it
+somewhere safe (`xcoin-wallet backup DEST`). The seed is still there if you ever want it:
+`xcoin-wallet seed` shows it after you type `REVEAL`. Keep the default (seed shown once)
+if you want a paper backup that survives losing both the file and the passphrase.
+
 ## Commands
 
 Global options: `--file <wallet>`, `--config <nex.conf>`, `--rpc-host/-port/-user/-password`,
@@ -84,7 +90,7 @@ Global options: `--file <wallet>`, `--config <nex.conf>`, `--rpc-host/-port/-use
 
 | Command | What it does |
 |---|---|
-| `new [--offline] [--no-clear]` | Create a wallet; prints the seed once, then offers a screen+scrollback wipe. |
+| `new [--offline] [--no-clear] [--no-reveal]` | Create a wallet; prints the seed once, then offers a screen+scrollback wipe. `--no-reveal` prints no seed: the `.mmm` file is the backup (`seed` can still show it later). |
 | `address` / `receive [--index N] [--verbose] [--identity] [--carried]` | Show the receiving (two-leaf) address; `--carried` shows the single-leaf form of the same key, `--identity` the key's forum identity (`xid1…`) instead. `--json` includes both address forms. |
 | `identity [--index N] [--verbose]` | Show the forum identity `xid1…` of the key at `--index` (same as `address --identity`). |
 | `addresses [--start N] [--count N] [--identity] [--carried]` | List derived (two-leaf) addresses, one per line; `--carried` adds each key's single-leaf form, `--identity` its `xid1…`. |
@@ -95,9 +101,9 @@ Global options: `--file <wallet>`, `--config <nex.conf>`, `--rpc-host/-port/-use
 | `history [--index N] [--from-height H]` | Full send/receive history (scans the chain; includes mempool). |
 | `info` | Chain, sync state, peers, mempool, and relay-fee status. |
 | `seed [--copy [--timeout S]] [--yes]` | Re-display the seed (type `REVEAL`) or copy it to the clipboard. |
-| `card-provision` (`new --card`) | Create a **card-bound** wallet on an NTAG 424 DNA card — the seed is never displayed. |
+| `card-provision` (`new --card`) `[--one-file]` | Create a **card-bound** wallet on an NTAG 424 DNA card — the seed is never displayed. `--one-file` keeps the card's keys inside the `.mmm` (passphrase required), so no `card-<uid>.auth` file is needed. |
 | `card-backup [--auto-swap]` | Provision a duplicate backup card that unlocks the same wallet. `--auto-swap` sees the swap on the reader (wallet card off, blank card on) instead of waiting for Enter; a card that is not factory-fresh, or the wallet card put back, is refused before anything is written. |
-| `card-status` | Which cards unlock this card wallet (from `~/.xcoin` key files; no tap, no passphrase). `backup_supported` is `false`, with a `note` saying why, when no backup card can be made on this Mac: no key file for the wallet's cards here (they were set up on another Mac), the card software is not installed (`pyscard`, which the reader needs, or `cryptography`; each is checked by importing it, and the note names only the missing ones), or a dex-era wallet (made with dex-wallet-cli, where its backup cards are made). |
+| `card-status` | Which cards unlock this card wallet (from `~/.xcoin` key files; no tap, no passphrase; a one-file wallet's cards are sealed inside it, so it only says backups are possible). `backup_supported` is `false`, with a `note` saying why, when no backup card can be made on this Mac: no key file for the wallet's cards here (they were set up on another Mac), the card software is not installed (`pyscard`, which the reader needs, or `cryptography`; each is checked by importing it, and the note names only the missing ones), or a dex-era wallet (made with dex-wallet-cli, where its backup cards are made). |
 | `card-test` | Prove a provisioned card authenticates and yields its factor (read-only). |
 | `card-list` | List provisioned cards known to this Mac. |
 | `card-reset --yes` | Factory-reset a card and retire its key file (refused on permanent cards). |
@@ -274,6 +280,10 @@ xcoin-wallet new --card --file ~/.xcoin/wallet001.mmm
 # From then on, any command that needs the key asks you to tap the card:
 xcoin-wallet balance --index 0        # tap to scan
 xcoin-wallet send <dest> 1.0          # tap to sign
+
+# Or ONE-FILE: the card's keys live inside the .mmm under your passphrase, so
+# file + card + passphrase is the whole wallet (no ~/.xcoin/card-<uid>.auth to back up):
+xcoin-wallet new --card --one-file --file ~/.xcoin/wallet002.mmm
 
 # Make a duplicate backup card (there is no paper backup — do this):
 xcoin-wallet card-backup --file ~/.xcoin/wallet001.mmm

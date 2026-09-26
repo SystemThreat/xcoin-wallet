@@ -396,8 +396,8 @@ sys.exit(w.main(["--file", str(d / "w.mmm"), "--json", *sys.argv[3:]]))
         p = self.dir / "dex.mmm"; p.write_bytes(w.MMM5_MAGIC + bytes([w.KIND_CARD]) + fam + len(a).to_bytes(2, "big") + a + b)
         d = self.status_json(file=p)
         self.assertEqual({k: d[k] for k in ("card", "format", "family", "cards", "count", "backup_supported")},
-                         {"card": True, "format": "mmm5", "family": fam.hex(), "cards": [], "count": None, "backup_supported": False})
-        self.assertEqual(d["note"], DEX_NOTE)                            # MMM shows it word for word as the badge
+                         {"card": True, "format": "mmm5", "family": fam.hex(), "cards": [], "count": None, "backup_supported": True})
+        self.assertIn("One-file card wallet", d["note"]); self.assertIn("card-backup", d["note"])
     def test_other_dex_card_kinds(self):
         fam = bytes.fromhex("0f0e0d0c0b0a0908")
         for name, blob, fmt in (("v3.mmm", w.MMM3_MAGIC + fam + os.urandom(120), "mmm3"),

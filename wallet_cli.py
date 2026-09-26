@@ -467,19 +467,56 @@ def mmm5_seed(blob, factor_bytes, passphrase):
                                         2 + 32 + SLH_SEED_SIZE, 2 + 64 + SLH_SEED_SIZE,
                                         "wrong card (or passphrase), or corrupt wallet file"))
 
+def _seal(secret, prefix, payload):
+    """Ported verbatim from dex-wallet-cli: the write side of _unseal."""
+    salt, nonce = os.urandom(16), os.urandom(16)
+    enc_key, mac_key = _scrypt(secret, salt)
+    stream = hashlib.shake_256(enc_key + nonce).digest(len(payload))
+    body = prefix + salt + nonce + bytes(a ^ b for a, b in zip(payload, stream))
+    return body + hmac.new(mac_key, body, hashlib.sha256).digest()
+
+def wallet_payload(seed_hex):
+    seed = bytes.fromhex(seed_hex)
+    return bytes([PAYLOAD_VERSION, len(seed)]) + seed + slh_seed(seed_hex, 0)
+
+def mmm5_encode(family_hex, cards, passphrase, seed_hex=None, factor_bytes=None, sealed_b=None):
+    """Ported from dex-wallet-cli. Either (seed_hex, factor_bytes) to seal the seed afresh, or
+    sealed_b to keep an existing seed block untouched (card-key updates only)."""
+    if not passphrase: raise WalletError("a one-file card wallet needs a passphrase")
+    a = _seal(passphrase.encode(), MMM5A, json.dumps(cards, separators=(",", ":")).encode())
+    if sealed_b is None:
+        sealed_b = _seal(factor_bytes + passphrase.encode(), MMM5B, wallet_payload(seed_hex))
+    return MMM5_MAGIC + bytes([KIND_CARD]) + bytes.fromhex(family_hex) + len(a).to_bytes(2, "big") + a + sealed_b
+
 class Mmm5CardStore:
-    """READ-ONLY view of card_seed's key store kept INSIDE the .mmm file (block A).
-    Adapted from dex-wallet-cli's MmmCardStore: unlock scope only, so the writing
-    half (save/update/atomic rewrite) is deliberately not ported."""
+    """card_seed's key store kept INSIDE the .mmm file (block A), ported from dex-wallet-cli's
+    MmmCardStore. Every save or update rewrites the file atomically with the seed block
+    untouched, so a fault during key rotation leaves the keys on disk, never a bricked card."""
     def __init__(self, path, passphrase):
         self.path, self.pw = Path(path), passphrase
         self.blob = self.path.read_bytes()
         self.family, _, self.sealed_b = mmm5_parts(self.blob)
         self.cards = mmm5_cards(self.blob, passphrase)
+    def _write(self):
+        blob = mmm5_encode(self.family, self.cards, self.pw, sealed_b=self.sealed_b)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f: f.write(blob); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, self.path); self.blob = blob
     def exists(self, uid_hex): return any(c.get("uid") == uid_hex for c in self.cards)
     def load(self, uid_hex):
         for c in self.cards:
             if c.get("uid") == uid_hex: return dict(c)
+        raise WalletError(f"card {uid_hex} does not belong to this wallet")
+    def save(self, record):
+        if self.exists(record["uid"]): raise WalletError(f"card {record['uid']} is already in this wallet")
+        self.cards.append(dict(record)); self._write(); return record
+    def update(self, uid_hex, updates):
+        for c in self.cards:
+            if c.get("uid") == uid_hex:
+                c.update(updates)
+                for k in [k for k, v in c.items() if v is None]: c.pop(k)   # None drops a key (sealing)
+                self._write(); return dict(c)
         raise WalletError(f"card {uid_hex} does not belong to this wallet")
 
 def _head(path, n=32):
@@ -1208,20 +1245,84 @@ def offer_wipe(args):
 def cmd_new(args):
     p = Path(args.file)
     if p.exists(): raise WalletError(f"refusing to overwrite existing wallet {p}")
+    if getattr(args, "one_file", False) and not args.card:
+        raise WalletError("--one-file is for card wallets: use it with --card")
     if args.card:
-        return cmd_new_card(args, p)
-    seed = os.urandom(32).hex(); write_seed(p, seed, new_passphrase(args))
-    data = {"file": str(p)}
+        return (cmd_new_card_one_file if getattr(args, "one_file", False) else cmd_new_card)(args, p)
+    pw = new_passphrase(args)
+    seed = os.urandom(32).hex(); write_seed(p, seed, pw)
+    data = {"file": str(p), "passphrase_protected": bool(pw)}
     if not args.offline:
         data["address"] = derive(make_backend(args), seed, 0)["address"]
     if args.json:
         # The seed is deliberately NOT included in JSON output; read the file
         # or use `seed --json --yes`.
         emit_json(data); return
-    print(f"Created wallet: {p}\nSeed: {seed}\n\nWRITE THE SEED DOWN OFFLINE. Anyone with it controls the wallet.")
-    offer_wipe(args)
+    if getattr(args, "no_reveal", False):
+        print(f"Created wallet: {p}\nThe seed was NOT displayed: the .mmm file is the backup.")
+        print("Copy the file somewhere safe (xcoin-wallet backup DEST). If you ever need the seed,")
+        print("`xcoin-wallet seed` shows it after you type REVEAL.")
+        if not data.get("passphrase_protected"):
+            print("NOTE: no passphrase, so anyone with the file and this CLI can open it.")
+    else:
+        print(f"Created wallet: {p}\nSeed: {seed}\n\nWRITE THE SEED DOWN OFFLINE. Anyone with it controls the wallet.")
+        offer_wipe(args)
     print(f"Wallet file:     {p}")
     if "address" in data: print(f"Primary address: {data['address']}")
+
+def cmd_new_card_one_file(args, p):
+    """Create a ONE-FILE card wallet (mmm5-card, ported from dex-wallet-cli): the card's own keys
+    live in the .mmm under the passphrase, so file + card + passphrase is the whole wallet and no
+    card-<uid>.auth file is needed. The seed is NEVER displayed. Order, for crash safety: write
+    the file (seed sealed, no cards yet), then provision the card, whose keys are saved into the
+    file BEFORE they are rotated off the factory keys."""
+    cs = _card_module(); cs.disable_core_dumps()
+    if not args.offline and args.json:
+        raise WalletError("card wallet creation is interactive; use --offline for JSON")
+    pw = new_passphrase(args)
+    if not pw: raise WalletError("a one-file card wallet needs a passphrase (it guards the card keys kept in the file)")
+    factor = cs.SecureBuffer(os.urandom(cs.FACTOR_LEN))
+    seedbuf = cs.SecureBuffer(os.urandom(32))
+    try:
+        family = cs.family_of(factor.bytes())
+        blob = mmm5_encode(family, [], pw, seed_hex=seedbuf.hex(), factor_bytes=factor.bytes())
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f: f.write(blob); f.flush(); os.fsync(f.fileno())
+        store = Mmm5CardStore(p, pw)
+        print("Provisioning the PRIMARY card — tap and hold it on the reader.", file=sys.stderr)
+        permanent = not args.resettable
+        try:
+            try:
+                with card_reader(cs) as transport:
+                    record = cs.provision_card(transport, factor, family, label=args.label or "primary",
+                                               before_write=provisioning_begin, store=store)
+            except BaseException:
+                if not store.cards: p.unlink(missing_ok=True)   # nothing was written to a card: no half wallet left
+                raise
+            event("card-ok")
+            if permanent:
+                cs.make_permanent(record["uid"], store=store)   # commit: discard master+write keys — IRREVERSIBLE
+        finally:
+            provisioning_end()
+        address = derive(make_backend(args), seedbuf.hex(), 0)["address"] if not args.offline else None
+        data = {"file": str(p), "card_uid": record["uid"], "family": family, "passphrase_protected": True,
+                "permanent": permanent, "format": "mmm5-card", "one_file": True}
+        if address: data["address"] = address
+    finally:
+        seedbuf.close(); factor.close()
+    if args.json: emit_json(data); return
+    print(f"\nOne-file card wallet created: {p}")
+    print(f"  Primary card UID: {data['card_uid']}   family: {family}")
+    print("  Everything is in that one file: the card's keys (under your passphrase) and the")
+    print("  seed (under the card AND your passphrase). No card-<uid>.auth file is needed.")
+    print("  The seed was NEVER displayed and cannot be — the card is the key.")
+    if permanent:
+        print("  SEALED PERMANENTLY: master + write keys discarded — this card can never")
+        print("  be reset or reused, and its factor can never be rewritten.")
+    if "address" in data: print(f"  Primary address:  {data['address']}")
+    print("\nIMPORTANT: with no printed seed, this card is your ONLY key. Make a DUPLICATE now:")
+    print(f"  xcoin-wallet card-backup --file {p}")
+    print("Back up the .mmm file too: file + card + passphrase is the whole wallet.")
 
 def cmd_new_card(args, p):
     """Create a card-bound wallet. The seed is generated, encrypted to the
@@ -1290,12 +1391,14 @@ def cmd_card_backup(args):
     cs = _card_module(); cs.disable_core_dumps()
     p = Path(args.file)
     if not is_card_wallet(p): raise WalletError(f"{p} is not a card-bound wallet")
-    if _wallet_format(p)[0] != "mmm2":
+    fmt = _wallet_format(p)[0]
+    if fmt not in ("mmm2", "mmm5-card"):
         raise WalletError("this is a dex-wallet-era card wallet (read-only here); make backup cards with dex-wallet-cli")
-    want_family = mmm2_family(p.read_bytes())
+    store = Mmm5CardStore(p, card_passphrase(required=True)) if fmt == "mmm5-card" else None   # its keys live in the file
+    want_family = store.family if store else mmm2_family(p.read_bytes())
     print("Step 1/2 — tap an EXISTING card for this wallet (to copy its key).", file=sys.stderr)
     with card_reader(cs) as t1:
-        factor, primary = read_card(cs, t1)
+        factor, primary = read_card(cs, t1, store)
     try:
         if cs.family_of(factor.bytes()) != want_family:
             raise WalletError("that card does not belong to this wallet")
@@ -1311,13 +1414,14 @@ def cmd_card_backup(args):
         else:
             input("Step 2/2 — remove it, place a FACTORY card, then press Enter... ")
             extra = {}
+        if store: extra["store"] = store
         try:
             with card_reader(cs) as t2:
                 record = cs.provision_card(t2, factor, want_family, label=args.label or "backup", **extra)
-            auth_file = cs.auth_path(record["uid"])
+            auth_file = p if store else cs.auth_path(record["uid"])
             permanent = not args.resettable
             if permanent:
-                cs.make_permanent(record["uid"])
+                (cs.make_permanent(record["uid"], store=store) if store else cs.make_permanent(record["uid"]))
         finally:
             provisioning_end()   # the write and its key-file update are done (or failed): SIGTERM stops it again
         event("card-ok")
@@ -1325,7 +1429,7 @@ def cmd_card_backup(args):
         factor.close()
     if args.json:
         emit_json({"ok": True, "card_uid": record["uid"], "family": want_family, "permanent": permanent,
-                   "cards": len(family_cards(want_family, cs.AUTH_DIR))} if args.auto_swap else
+                   "cards": len(store.cards) if store else len(family_cards(want_family, cs.AUTH_DIR))} if args.auto_swap else
                   {"backup_card_uid": record["uid"], "auth_file": str(auth_file), "family": want_family, "permanent": permanent})
     else:
         print(f"\nBackup card ready — UID {record['uid']} (family {want_family}).")
@@ -1380,7 +1484,11 @@ def cmd_card_status(args):
                          f"{n} cards unlock this wallet")
     elif card:
         data["family"] = mmm5_parts(p.read_bytes())[0] if fmt == "mmm5-card" else wallet_header(_head(p))["family"]
-        data["note"] = "This card wallet was made with dex-wallet-cli, so its backup cards are made there too."
+        if fmt == "mmm5-card":
+            data.update(backup_supported=True, note="One-file card wallet: its card keys are sealed inside the file under the "
+                        "passphrase, so no key file is needed on this Mac. Make a backup card with card-backup.")
+        else:
+            data["note"] = "This card wallet was made with dex-wallet-cli, so its backup cards are made there too."
     if args.json: emit_json(data); return
     print(f"{p}: " + (f"card wallet ({data['format']}), family {data['family']}" if card else f"{data['format']} wallet, no card"))
     for r in data["cards"]:
@@ -1952,8 +2060,10 @@ def parser():
     q.add_argument("--card", action="store_true", help="bind the wallet to an NTAG 424 DNA card (seed never displayed)")
     q.add_argument("--label", help="label for the provisioned card")
     q.add_argument("--resettable", action="store_true", help="keep factory-key rollback (card can be reset); default is permanent/sealed")
+    q.add_argument("--one-file", action="store_true", help="with --card: keep the card keys inside the .mmm (passphrase required), so no card-<uid>.auth file is needed")
+    q.add_argument("--no-reveal", action="store_true", help="do not print the seed at creation: the .mmm file is the backup (`seed` can still show it later)")
     q.set_defaults(fn=cmd_new)
-    q = sub.add_parser("card-provision", help="alias: create a card-bound wallet"); q.add_argument("--offline", action="store_true"); q.add_argument("--label"); q.add_argument("--resettable", action="store_true"); q.set_defaults(fn=cmd_new, card=True, no_clear=True)
+    q = sub.add_parser("card-provision", help="alias: create a card-bound wallet"); q.add_argument("--offline", action="store_true"); q.add_argument("--label"); q.add_argument("--resettable", action="store_true"); q.add_argument("--one-file", action="store_true"); q.set_defaults(fn=cmd_new, card=True, no_clear=True, no_reveal=True)
     q = sub.add_parser("card-backup", help="make a duplicate backup card for a card wallet"); q.add_argument("--label"); q.add_argument("--resettable", action="store_true")
     q.add_argument("--auto-swap", action="store_true", help="detect the card swap on the reader instead of waiting for Enter (for a parent program; events under XCOIN_EVENTS=1)")
     q.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS); q.set_defaults(fn=cmd_card_backup)

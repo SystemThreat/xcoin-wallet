@@ -526,7 +526,7 @@ def require_blank(card, uid_hex):
             raise CardError(f"card {uid_hex} is not blank (its keys were changed: it already belongs to a wallet) — "
                             "use a NEW factory-fresh card; nothing was written") from None
 
-def provision_card(transport, factor, family, label="", exclude=(), before_write=None):
+def provision_card(transport, factor, family, label="", exclude=(), before_write=None, store=None):
     """Provision a FACTORY card and store the factor. Saves the auth file itself
     (the caller no longer calls save_auth) and returns the record.
 
@@ -541,13 +541,14 @@ def provision_card(transport, factor, family, label="", exclude=(), before_write
          during rotation leaves the keys on disk, never a bricked card.
       3. Rotate key2 (read) + key3 (write) via master Case-1, then the master
          itself (Case-2). key2 (read-only) is KEPT to unlock; key0 (master) +
-         key3 (write) are what make_permanent() discards. Never prints secrets."""
+         key3 (write) are what make_permanent() discards. Never prints secrets.
+    `store` (a one-file .mmm wallet's key store) replaces the auth file, if given."""
     transport.wait_for_card()
     card = _connect(transport)
     uid_hex = card.uid().hex()
     if uid_hex in exclude:
         raise CardError(f"card {uid_hex} is the wallet card itself — take it off and place a NEW blank card; nothing was written")
-    if auth_path(uid_hex).exists():
+    if (store.exists(uid_hex) if store is not None else auth_path(uid_hex).exists()):
         raise CardError(f"card {uid_hex} is already provisioned — use a factory card")
     require_blank(card, uid_hex)
     if before_write: before_write()
@@ -565,7 +566,7 @@ def provision_card(transport, factor, family, label="", exclude=(), before_write
                   "master_key": master_key.hex(), "write_key": write_key.hex(),
                   "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                   "permanent": False, "state": "factor_written"}
-        _key_file_step(uid_hex, save_auth, record)
+        _key_file_step(uid_hex, store.save if store is not None else save_auth, record)
         # 3) rotate keys off factory (master session; master changed last)
         card.auth_ev2(KEY_APP_MASTER, FACTORY_KEY)
         card.change_key_diff(KEY_READ, read_key, FACTORY_KEY)
@@ -575,16 +576,18 @@ def provision_card(transport, factor, family, label="", exclude=(), before_write
         card.auth_ev2(KEY_READ, read_key)
         if card.read_full(CARD_FILE, FACTOR_OFFSET, FACTOR_LEN) != factor.bytes():
             raise CardError("verification read failed after key rotation")
-        return _key_file_step(uid_hex, _update_auth, uid_hex, {"state": "provisioned"})
+        return _key_file_step(uid_hex, store.update if store is not None else _update_auth, uid_hex, {"state": "provisioned"})
     except (Exception, KeyboardInterrupt) as e:
         # from the first write on a fault may leave the card half made: never retried, always named
         raise CardWriteError(f"the write to card {uid_hex} did not finish ({_one_line(e)})", e) from e
 
-def make_permanent(uid_hex):
+def make_permanent(uid_hex, store=None):
     """Seal a provisioned card: drop the master and write keys from its auth file,
     keeping only the READ-ONLY key. After this the card can never be reset or
     re-keyed (master gone), its factor can never be rewritten (write key gone),
     and its access rights can never be relaxed. IRREVERSIBLE."""
+    if store is not None:
+        return store.update(uid_hex, {"permanent": True, "master_key": None, "write_key": None})
     p = auth_path(uid_hex)
     rec = json.loads(p.read_text())
     rec.pop("master_key", None); rec.pop("write_key", None)
