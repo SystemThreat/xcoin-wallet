@@ -384,7 +384,23 @@ def child_seed(seed_hex, index):
     """SHAKE-256(SHAKE-256(seed || "NEX-PQ-MASTER")[32] || u32le(index) || "NEX-PQ-CHILD")[32]:
     the ML-DSA-65 KeyGen seed of key index `index` (the first chain's derivation, frozen)."""
     master = hashlib.shake_256(bytes.fromhex(seed_hex) + PQ_MASTER_DOMAIN).digest(32)
-    return hashlib.shake_256(master + index.to_bytes(4, "little") + PQ_CHILD_DOMAIN).digest(32)
+    return hashlib.shake_256(master + index_bytes(index) + PQ_CHILD_DOMAIN).digest(32)
+
+MAX_INDEX = (1 << 512) - 1
+
+def index_bytes(index):
+    """The index as the derivation hashes it: below 2**32 the 4-byte little-endian form every
+    xCoin wallet uses (src/pqhd.h), so existing addresses never change; from 2**32 up to
+    2**512-1 a 64-byte little-endian form (CernBank extended range). The lengths differ, so
+    the two can never collide."""
+    if not 0 <= index <= MAX_INDEX:
+        raise ValueError("index out of range (0 .. 2**512-1)")
+    return index.to_bytes(4, "little") if index < (1 << 32) else index.to_bytes(64, "little")
+
+def parse_index(text):
+    """An index as typed: decimal, or hexadecimal with a 0x prefix."""
+    t = str(text).strip().lower().replace("_", "")
+    return int(t, 16) if t.startswith("0x") else int(t, 10)
 
 def slh_seed_from_child(child):
     """SHAKE-256(child32 || "xcoin/hd/slh-dsa-sha2-128s/seed")[48]: dex-wallet-cli's SLH seed (the
@@ -2077,17 +2093,17 @@ def parser():
     q.add_argument("--timeout", type=int, default=60, help="auto-clear clipboard after N seconds (0 = never)")
     q.add_argument("--yes", action="store_true"); q.add_argument("--no-clear", action="store_true"); q.set_defaults(fn=cmd_seed)
     for name, fn in (("receive", cmd_receive), ("address", cmd_receive)):
-        q = sub.add_parser(name, help="show a receiving address"); q.add_argument("--index", type=int, default=0); q.add_argument("--verbose", action="store_true")
+        q = sub.add_parser(name, help="show a receiving address"); q.add_argument("--index", type=parse_index, default=0); q.add_argument("--verbose", action="store_true")
         q.add_argument("--identity", action="store_true", help="show the key's forum identity (xid1…) instead: a chat handle, nothing can be paid to it")
         q.add_argument("--carried", action="store_true", help="show the single-leaf (carried) form of the same key instead of the two-leaf address")
         q.set_defaults(fn=fn)
     q = sub.add_parser("identity", help="show the forum identity (xid1…) of the key at --index; same as `address --identity`")
-    q.add_argument("--index", type=int, default=101, help="key index (the forum identity convention is 101)"); q.add_argument("--verbose", action="store_true"); q.set_defaults(fn=cmd_receive, identity=True)
-    q = sub.add_parser("addresses", help="list derived addresses"); q.add_argument("--start", type=int, default=0); q.add_argument("--count", type=int, default=5)
+    q.add_argument("--index", type=parse_index, default=101, help="key index (the forum identity convention is 101)"); q.add_argument("--verbose", action="store_true"); q.set_defaults(fn=cmd_receive, identity=True)
+    q = sub.add_parser("addresses", help="list derived addresses"); q.add_argument("--start", type=parse_index, default=0); q.add_argument("--count", type=int, default=5)
     q.add_argument("--identity", action="store_true", help="also list each key's forum identity (xid1…)")
     q.add_argument("--carried", action="store_true", help="also list each key's single-leaf (carried) address"); q.set_defaults(fn=cmd_addresses)
     for name, fn in (("balance", cmd_balance), ("status", cmd_balance), ("utxos", cmd_utxos)):
-        q = sub.add_parser(name, help="show balance/UTXOs (maturity-aware; two-leaf and carried outputs)"); q.add_argument("--index", type=int, default=0); q.set_defaults(fn=fn)
+        q = sub.add_parser(name, help="show balance/UTXOs (maturity-aware; two-leaf and carried outputs)"); q.add_argument("--index", type=parse_index, default=0); q.set_defaults(fn=fn)
     q = sub.add_parser("send", help="send XID (fee auto-estimated unless --fee)")
     q.add_argument("destination"); q.add_argument("amount")
     q.add_argument("--fee", help="absolute fee in XID (overrides --feerate)")
@@ -2095,10 +2111,10 @@ def parser():
     q.add_argument("--max-fee", default=str(DEFAULT_MAX_FEE), help=f"refuse fees above this (default {DEFAULT_MAX_FEE} XID; with --split, the total)")
     q.add_argument("--split", action="store_true", help="pay an amount too large for one standard transaction as several independent ones, "
                    "all signed with one unlock (one card tap), then broadcast in turn")
-    q.add_argument("--index", type=int, default=0); q.add_argument("--yes", action="store_true"); q.add_argument("--dry-run", action="store_true")
+    q.add_argument("--index", type=parse_index, default=0); q.add_argument("--yes", action="store_true"); q.add_argument("--dry-run", action="store_true")
     q.set_defaults(fn=cmd_send)
     q = sub.add_parser("history", help="transaction history (scans the chain)")
-    q.add_argument("--index", type=int, default=0); q.add_argument("--from-height", type=int, default=0); q.set_defaults(fn=cmd_history)
+    q.add_argument("--index", type=parse_index, default=0); q.add_argument("--from-height", type=int, default=0); q.set_defaults(fn=cmd_history)
     q = sub.add_parser("info", help="node/chain/mempool status"); q.set_defaults(fn=cmd_info)
     for name in ("restore", "import"):
         q = sub.add_parser(name, help="restore wallet from a seed")
@@ -2112,7 +2128,7 @@ def parser():
     q = sub.add_parser("signmessage", help="sign a one-line message with the key at --index (FIPS 204 ML-DSA-65); used by NerdMiner login")
     q.add_argument("--template", help="message with {address} standing for the signer's name: its forum identity xid1… (default) or, with --as address, its xpa1r… two-leaf address")
     q.add_argument("--message", help="literal message (no substitution)")
-    q.add_argument("--index", type=int, default=101, help="key index (the forum identity convention is 101)")
+    q.add_argument("--index", type=parse_index, default=101, help="key index (the forum identity convention is 101)")
     q.add_argument("--as", dest="sign_as", choices=("identity", "address"), default="identity",
                    help="sign as the forum identity xid1… (default) or as the witness v3 payment address")
     q.set_defaults(fn=cmd_signmessage)
